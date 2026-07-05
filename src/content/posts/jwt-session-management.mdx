@@ -1,0 +1,380 @@
+---
+author: 허진수
+pubDatetime: 2026-07-05T13:00:00.000Z
+title: JWT 발급 및 세션 관리 — NORMAL / ADMIN 전략 비교
+slug: jwt-session-management
+featured: false
+tags:
+  - spring
+  - jwt
+  - redis
+  - session
+  - kotlin
+  - security
+description: ES256 JWT 발급 인프라, Redis 세션 구조, NORMAL/ADMIN별 세션 전략, Rotating Refresh Token 정리
+---
+
+## 개요
+
+카카오 OAuth2 로그인([카카오 OAuth2 로그인 구현](/posts/kakao-oauth2-login))과 관리자 Credential 로그인은 진입점이 다르지만, 토큰 발급과 세션 관리는 같은 인프라를 공유한다.
+
+```
+카카오 로그인 → OAuth2SuccessHandler  ─┐
+                                       ├─ JwtSigner (EcJwtSigner)
+관리자 로그인 → AdminLoginService     ─┘  SessionManager
+                                           ↓
+                                       Redis (세션 + refresh token)
+```
+
+---
+
+## 1. JWT 인프라
+
+### 서명 / 검증 — ES256 (ECDSA)
+
+#### HS256 / RS256 / ES256 비교
+
+JWT 서명 알고리즘의 주요 세 가지를 비교하면 아래와 같다.
+
+| 항목 | HS256 | RS256 | ES256 |
+|------|-------|-------|-------|
+| 방식 | 대칭 (HMAC) | 비대칭 (RSA) | 비대칭 (ECDSA) |
+| 키 종류 | 비밀키 1개 | private + public | private + public |
+| 검증 서버 | 비밀키 보유 서버만 | public key 배포로 누구나 | public key 배포로 누구나 |
+| 키 유출 시 위험 | 토큰 위조 가능 | 검증만 가능, 위조 불가 | 검증만 가능, 위조 불가 |
+| 동등 보안 강도의 키 크기 | 256 bit | 3072 bit | 256 bit (P-256) |
+| 서명 크기 | 32 byte | 384 byte (3072 bit 기준) | 64 byte |
+| 서명 / 검증 속도 | 빠름 | 느림 | 빠름 |
+
+**HS256**은 검증 서버마다 비밀키를 공유해야 해 서비스가 분리될수록 키 유출 경로가 늘어난다. 키가 노출되면 공격자가 임의의 토큰을 직접 발급할 수 있다.
+
+**RS256**은 비대칭키라 public key만 배포하면 검증이 가능하다. 그러나 동등한 보안 강도를 위해 3072 bit 이상의 키가 필요하고, 서명 크기도 크다. JWT는 쿠키나 Authorization 헤더에 실리므로 토큰 크기가 작을수록 유리하다.
+
+**ES256**은 RSA와 같은 비대칭키 보안성을 유지하면서 키 크기와 서명 크기가 훨씬 작다. P-256 곡선의 256 bit 키가 RSA 3072 bit와 동등한 보안 강도를 제공한다. 서명·검증 연산도 RSA보다 빠르다.
+
+현재는 단일 서버지만, 추후 서비스가 분리될 때 각 서버에 public key만 배포하면 된다. private key는 토큰을 발급하는 IAM 서버 한 곳만 보유한다.
+
+```kotlin
+// 서명: EC Private Key (PKCS8 PEM)
+sealed class EcJwtSigner(privateKeyPem: String) : JwtSigner {
+    fun buildToken(
+        subject: String,
+        expiration: Long,
+        claims: Map<String, Any>,
+    ): String { ... }  // Nimbus JOSE — ES256
+}
+
+// 검증: EC Public Key (X509 PEM)
+sealed class EcJwtVerifier(publicKeyPem: String) : JwtVerifier {
+    fun verify(token: String): JWTClaimsSet { ... }
+}
+```
+
+### JwtAuthenticationFilter
+
+모든 요청에서 `accessToken` 쿠키를 읽어 JWT를 검증하고 `SecurityContextHolder`에 세팅한다.
+
+```kotlin
+class JwtAuthenticationFilter(private val jwtVerifier: JwtVerifier) : OncePerRequestFilter() {
+    override fun doFilterInternal(...) {
+        val token = request.cookies?.find { it.name == "accessToken" }?.value
+            ?: run { filterChain.doFilter(request, response); return }
+
+        val claims = jwtVerifier.verify(token)
+        SecurityContextHolder.getContext().authentication = JwtAuthenticationToken(claims)
+        filterChain.doFilter(request, response)
+    }
+}
+```
+
+### JWT Properties — 역할별 분리
+
+NORMAL 유저와 ADMIN 유저의 JWT 만료 시간을 별도 설정으로 관리한다.
+
+```kotlin
+@Component
+class JwtPropertyFactory(
+    @UserJwt  private val normalProps: JwtProperties,   // jwt.*
+    @AdminJwt private val adminProps: JwtProperties,    // admin.jwt.*
+) {
+    fun getProperty(role: UserRole): JwtProperties = when (role) {
+        UserRole.NORMAL -> normalProps
+        UserRole.ADMIN  -> adminProps
+    }
+}
+```
+
+```yaml
+# application.yml
+jwt:                          # NORMAL 유저
+  public-key: ${JWT_PUBLIC_KEY}
+  private-key: ${JWT_PRIVATE_KEY}
+  expiration: 1800000         # 30분
+  refresh-expiration: 604800000  # 7일
+
+admin:
+  jwt:                        # ADMIN 유저
+    public-key: ${ADMIN_JWT_PUBLIC_KEY}
+    private-key: ${ADMIN_JWT_PRIVATE_KEY}
+    expiration: 1800000
+    refresh-expiration: 604800000
+```
+
+---
+
+## 2. 세션 도메인 모델
+
+### Session / SessionStore
+
+```kotlin
+data class SessionStore(
+    val userId: UUID,
+    val userRole: UserRole,
+) {
+    // Redis ZSet 키 — 유저별 세션 목록
+    val sessionStoreKey: String
+        get() = "iam:${userRole.displayName}:$userId:session_index"
+
+    val maxSessionCount: Int
+        get() = when (userRole) {
+            UserRole.NORMAL -> 1
+            UserRole.ADMIN  -> 3
+        }
+}
+
+class Session private constructor(val id: UUID, val sessionStore: SessionStore) {
+    // Redis String 키 — 개별 세션의 refresh token
+    val sessionKey: String
+        get() = "iam:${sessionStore.userRole.displayName}:${sessionStore.userId}:sessions:$id"
+
+    companion object {
+        fun generate(sessionStore: SessionStore): Session = Session(UUID.randomUUID(), sessionStore)
+        fun of(id: String, sessionStore: SessionStore): Session = Session(UUID.fromString(id), sessionStore)
+    }
+}
+```
+
+### Redis 키 구조
+
+| 키 | 타입 | 값 | TTL |
+|---|---|---|---|
+| `iam:{role}:{userId}:session_index` | ZSet | sessionId (score: 생성 epoch ms) | - |
+| `iam:{role}:{userId}:sessions:{sessionId}` | String | refresh token JWT | 역할별 설정값 |
+
+---
+
+## 3. 토큰 발급 비교 — NORMAL vs ADMIN
+
+두 진입점 모두 동일한 `JwtSigner`와 `SessionManager`를 사용하지만, 세션 정리 전략이 다르다.
+
+| 항목 | NORMAL (`OAuth2SuccessHandler`) | ADMIN (`AdminLoginService`) |
+|---|---|---|
+| 인증 방식 | Spring OAuth2 (카카오) | ID/Password Credential |
+| JWT Properties | `@UserJwt` | `@AdminJwt` |
+| 세션 정리 전략 | `cleanSessions` | `rotateAndDelete` |
+| 최대 동시 세션 수 | 1 | 3 |
+| `role` claim | `"normal"` | `"admin"` |
+
+### NORMAL — `cleanSessions`
+
+만료된 고아 세션만 제거한다. refresh token이 이미 Redis TTL로 소멸한 세션 인덱스 항목을 ZSet에서 삭제한다. 살아있는 세션은 건드리지 않는다.
+
+```kotlin
+override fun cleanSessions(sessionStore: SessionStore) {
+    val sessions = sessionRepository.getAllSessions(sessionStore)
+    sessions.forEach { session ->
+        val token = refreshTokenRepository.getToken(session)
+        if (token == null) {
+            sessionRepository.removeSession(session)  // 고아 인덱스 정리
+        }
+    }
+}
+```
+
+NORMAL 유저는 `maxSessionCount = 1`이므로, 고아 정리 후에도 살아있는 세션이 있으면 새 세션이 그 위에 추가된다. 사실상 새 로그인이 기존 세션을 자연스럽게 대체하는 구조다.
+
+### ADMIN — `rotateAndDelete`
+
+세션 수가 한계(`maxSessionCount = 3`)에 도달하면 가장 오래된 세션을 명시적으로 제거하고 새 세션을 추가한다.
+
+```kotlin
+override fun rotateAndDelete(sessionStore: SessionStore) {
+    // ZSet에서 score 가장 낮은(가장 오래된) 세션을 pop
+    sessionRepository.rotateSession(sessionStore)?.run {
+        refreshTokenRepository.delete(this)  // refresh token도 함께 삭제
+    }
+}
+```
+
+### AdminLoginService 전체
+
+```kotlin
+@Service
+class AdminLoginService(
+    private val adminUserRepository: AdminUserRepository,
+    private val passwordEncoder: PasswordEncoder,
+    private val jwtSigner: JwtSigner,
+    @AdminJwt private val jwtProperties: JwtProperties,
+    private val sessionManager: SessionManager,
+) : AdminLoginUseCase {
+
+    override fun execute(command: AdminLoginCommand): TokenResult {
+        val adminUser = adminUserRepository.findByLoginId(command.loginId)
+            ?: throw UnauthorizedException(IamErrorCode.CREDENTIAL_INVALID)
+
+        if (!passwordEncoder.matches(command.rawPassword, adminUser.credentials.password))
+            throw UnauthorizedException(IamErrorCode.CREDENTIAL_INVALID)
+
+        val sessionStore = SessionStore(adminUser.id.value, UserRole.ADMIN)
+        val session = Session.generate(sessionStore)
+
+        val accessToken = jwtSigner.buildToken(
+            subject = adminUser.id.value.toString(),
+            expiration = jwtProperties.expiration,
+            claims = mapOf("type" to TokenType.ACCESS.value, "sessionId" to session.id.toString(), "role" to UserRole.ADMIN.displayName),
+        )
+        val refreshToken = jwtSigner.buildToken(
+            subject = adminUser.id.value.toString(),
+            expiration = jwtProperties.refreshExpiration,
+            claims = mapOf("type" to TokenType.REFRESH.value, "sessionId" to session.id.toString(), "role" to UserRole.ADMIN.displayName),
+        )
+
+        sessionManager.rotateAndDelete(sessionStore)   // 3개 초과 시 oldest 제거
+        sessionManager.saveSession(session, refreshToken, jwtProperties.refreshExpiration)
+
+        return TokenResult(accessToken, refreshToken, jwtProperties, UserRole.ADMIN)
+    }
+}
+```
+
+---
+
+## 4. Rotating Refresh Token — 탈취 감지
+
+`RefreshTokenService`는 NORMAL / ADMIN 역할에 관계없이 동일하게 동작한다. refresh token의 `role` claim을 읽어 `JwtPropertyFactory`로 적절한 properties를 선택한다.
+
+```kotlin
+@Service
+class RefreshTokenService(
+    private val jwtSigner: JwtSigner,
+    private val refreshTokenParser: RefreshTokenParser,
+    private val sessionManager: SessionManager,
+    private val jwtPropertyFactory: JwtPropertyFactory,
+) : RefreshTokenUseCase {
+
+    override fun execute(refreshToken: String): TokenResult {
+        val parsed = refreshTokenParser.parse(refreshToken)  // 서명 검증 + claims 추출
+        val role = parsed.session.sessionStore.userRole
+        val properties = jwtPropertyFactory.getProperty(role)
+
+        val stored = sessionManager.getTokenFromSession(parsed.session)
+            ?: throw UnauthorizedException(IamErrorCode.LOGIN_REQUIRED)
+
+        // 저장된 토큰 ≠ 전달된 토큰 → 탈취 의심
+        if (stored != refreshToken) {
+            sessionManager.removeSession(parsed.session)
+            throw UnauthorizedException(IamErrorCode.TOKEN_STOLEN)
+        }
+
+        // 토큰 회전: 기존 세션 제거 → 새 세션 생성
+        val newSession = Session.generate(parsed.session.sessionStore)
+        val newAccessToken = jwtSigner.buildToken(
+            subject = parsed.userId,
+            expiration = properties.expiration,
+            claims = mapOf("type" to "access", "sessionId" to newSession.id.toString(), "role" to role.displayName),
+        )
+        val newRefreshToken = jwtSigner.buildToken(
+            subject = parsed.userId,
+            expiration = properties.refreshExpiration,
+            claims = mapOf("type" to "refresh", "sessionId" to newSession.id.toString(), "role" to role.displayName),
+        )
+
+        sessionManager.removeSession(parsed.session)
+        sessionManager.saveSession(newSession, newRefreshToken, properties.refreshExpiration)
+
+        return TokenResult(newAccessToken, newRefreshToken, properties, role)
+    }
+}
+```
+
+탈취 감지 원리: refresh token을 사용하면 즉시 새 토큰으로 교체된다. 공격자가 탈취한 토큰을 나중에 사용하면 Redis에 저장된 토큰과 다르므로 세션이 강제 삭제된다.
+
+---
+
+## 5. Logout
+
+```kotlin
+@Service
+class LogOutService(
+    private val refreshTokenParser: RefreshTokenParser,
+    private val sessionManager: SessionManager,
+) : LogOutUseCase {
+
+    override fun execute(refreshToken: String) {
+        val parsed = refreshTokenParser.parse(refreshToken)
+        sessionManager.removeSession(parsed.session)
+        // ZSet session_index 항목 제거 + String refresh token 키 삭제
+    }
+}
+```
+
+NORMAL / ADMIN 구분 없이 동일 로직. refresh token에서 sessionId와 role을 파싱해 Redis 키를 특정한다.
+
+---
+
+## 6. AuthController
+
+```kotlin
+@RestController
+class AuthController(
+    private val refreshTokenUseCase: RefreshTokenUseCase,
+    private val logOutUseCase: LogOutUseCase,
+    private val adminLoginUseCase: AdminLoginUseCase,
+) {
+    @PostMapping("/auth/refresh")
+    fun refresh(
+        @CookieValue refreshToken: String,
+        response: HttpServletResponse,
+    ): ResponseEntity<Void> {
+        val result = refreshTokenUseCase.execute(refreshToken)
+        response.addHeader(SET_COOKIE, buildCookie("accessToken", result.accessToken, path = "/").toString())
+        response.addHeader(SET_COOKIE, buildCookie("refreshToken", result.refreshToken, path = "/auth").toString())
+        return ResponseEntity.ok().build()
+    }
+
+    @PostMapping("/auth/logout")
+    fun logout(
+        @CookieValue refreshToken: String,
+        response: HttpServletResponse,
+    ): ResponseEntity<Void> {
+        logOutUseCase.execute(refreshToken)
+        response.addHeader(SET_COOKIE, expireCookie("accessToken").toString())
+        response.addHeader(SET_COOKIE, expireCookie("refreshToken").toString())
+        return ResponseEntity.ok().build()
+    }
+
+    @PostMapping("/auth/admin/login")
+    fun adminLogin(
+        @RequestBody @Valid request: AdminLoginRequest,
+        response: HttpServletResponse,
+    ): ResponseEntity<Void> {
+        val result = adminLoginUseCase.execute(AdminLoginCommand(request.username, request.password))
+        response.addHeader(SET_COOKIE, buildCookie("accessToken", result.accessToken, path = "/").toString())
+        response.addHeader(SET_COOKIE, buildCookie("refreshToken", result.refreshToken, path = "/auth").toString())
+        return ResponseEntity.ok().build()
+    }
+}
+```
+
+---
+
+## 핵심 설계 포인트 요약
+
+| 항목 | 선택 | 이유 |
+|---|---|---|
+| JWT 알고리즘 | ES256 (ECDSA) | 비대칭키 → 공개키로만 검증 가능, MSA 확장 용이 |
+| Refresh Token 보관 | Redis (TTL) | 서버 주도 만료, 세션 수 제한, 탈취 감지 가능 |
+| Refresh Token 전략 | Rotating | 재사용 감지 시 세션 강제 삭제 → 탈취 피해 최소화 |
+| 세션 정리 전략 | NORMAL: `cleanSessions` (고아 정리) / ADMIN: `rotateAndDelete` (oldest 제거) | NORMAL은 단일 세션이라 고아만 정리하면 충분, ADMIN은 다중 세션을 명시적으로 순환 |
+| 최대 세션 수 | NORMAL=1, ADMIN=3 | 일반 유저 중복 로그인 방지, 관리자는 다수 디바이스 허용 |
+| JWT Properties 분리 | `@UserJwt` / `@AdminJwt` | 역할별 만료 시간을 독립 설정으로 제어 |

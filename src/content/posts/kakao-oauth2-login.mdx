@@ -1,0 +1,486 @@
+---
+author: 허진수
+pubDatetime: 2026-07-05T12:00:00.000Z
+title: Spring Security + 카카오 OAuth2 로그인 구현 (DDD 아키텍처)
+slug: kakao-oauth2-login
+featured: false
+tags:
+  - spring
+  - oauth2
+  - kakao
+  - kotlin
+  - security
+description: Spring Security OAuth2 + 카카오 로그인을 DDD 레이어드 아키텍처에 녹여 구현한 흐름 정리
+---
+
+## 전체 흐름 요약
+
+```
+클라이언트 → /oauth2/authorization/kakao
+         → (카카오 동의 화면)
+         → /login/oauth2/code/kakao?code=...
+         → KakaoOAuth2UserService (유저 조회/생성)
+         → OAuth2SuccessHandler (JWT 발급 + Redis 세션 저장)
+         → Set-Cookie: accessToken / refreshToken
+```
+
+---
+
+## 프로젝트 구조
+
+`iam` 모듈(Identity and Access Management)을 기준으로 DDD 레이어드 아키텍처를 따른다.
+
+```
+iam/
+├── presentation/     ← Controller, Request/Response DTO
+├── app/              ← UseCase 인터페이스, Application Service, Command/Result DTO
+├── domain/           ← Aggregate, Entity, VO, Repository 인터페이스
+└── infra/
+    ├── configuration/  ← SecurityConfig, JWT, OAuth2SuccessHandler
+    ├── external/       ← KakaoOAuth2UserService, OAuth2UserAdapter
+    └── persistence/    ← JPA Entity, Redis Repository, QueryDSL
+```
+
+---
+
+## 1. Spring Security OAuth2 설정
+
+**`infra/configuration/SecurityConfig.kt`**
+
+```kotlin
+oauth2Login {
+    userInfoEndpoint {
+        userService = kakaoOAuth2UserService      // 카카오 (표준 OAuth2)
+        oidcUserService = appleOauthUserService   // 애플 (OIDC)
+    }
+    authenticationSuccessHandler = oAuth2SuccessHandler
+    authenticationFailureHandler = AuthenticationFailureHandler { _, response, _ ->
+        writeErrorResponse(response, ErrorResponse.of(IamErrorCode.LOGIN_REQUIRED))
+    }
+}
+```
+
+인증 없이 접근 가능한 경로:
+
+| Path | 설명 |
+|---|---|
+| `/oauth2/**` | Spring이 카카오 인가 요청 redirect를 처리하는 엔드포인트 |
+| `/login/**` | 카카오가 code를 전달하는 콜백 엔드포인트 (`/login/oauth2/code/kakao`) |
+| `/auth/refresh` | 토큰 갱신 |
+| `/auth/admin/login` | 관리자 로그인 |
+
+---
+
+## 2. KakaoOAuth2UserService — 유저 조회/생성
+
+**`infra/external/KakaoOAuth2UserService.kt`**
+
+```kotlin
+@Service
+class KakaoOAuth2UserService(
+    private val userRepository: UserRepository,
+) : OAuth2UserService<OAuth2UserRequest, OAuth2User> {
+
+    internal var delegate: OAuth2UserService<OAuth2UserRequest, OAuth2User> = DefaultOAuth2UserService()
+
+    override fun loadUser(userRequest: OAuth2UserRequest?): OAuth2User {
+        val oAuth2User = delegate.loadUser(userRequest)   // KAKAO_USER_INFO_URI 호출
+        val attributes = oAuth2User.attributes
+        val providerId = attributes["id"]?.toString()
+            ?: throw OAuth2AuthenticationException(...)
+
+        val user = userRepository.findByProvider(providerId, OAuthProvider.KAKAO)
+            ?: userRepository.save(User.register(OAuthProvider.KAKAO, providerId))
+
+        return OAuth2UserAdapter(user, attributes)
+    }
+}
+```
+
+- `DefaultOAuth2UserService`가 카카오 유저 정보 엔드포인트를 호출하고 응답에서 `id`(카카오 숫자 식별자)를 추출한다.
+- `(providerId, OAuthProvider.KAKAO)` 조합으로 기존 유저를 찾고, 없으면 `User.register()`로 신규 생성한다.
+- 결과를 `OAuth2UserAdapter`로 감싸서 반환한다. `OAuth2UserAdapter`는 `OAuth2User`와 `AuthenticatedUser`를 모두 구현해 이후 `OAuth2SuccessHandler`에서 도메인 `User`를 꺼낼 수 있게 한다.
+
+---
+
+## 3. 도메인 모델
+
+### User Aggregate
+
+```kotlin
+class User private constructor(
+    val id: UserId,
+    val provider: OAuthProvider,
+    val providerId: String,
+    var status: UserStatus,
+    var userProfile: UserProfile?,
+) : AggregateRoot() {
+
+    companion object {
+        // 신규 가입 시 진입점 — REGISTERED 상태로 시작, 프로필 없음
+        fun register(provider: OAuthProvider, providerId: String): User = User(
+            id = UserId.generate(),
+            provider = provider,
+            providerId = providerId,
+            status = UserStatus.REGISTERED,
+            userProfile = null,
+        )
+    }
+}
+```
+
+### 상태 전이
+
+```
+REGISTERED → (프로필 제출) → PROFILE_SUBMITTED → (약관 동의) → ACTIVE
+```
+
+### 관련 타입
+
+```kotlin
+enum class OAuthProvider(val displayName: String) {
+    KAKAO("카카오"),
+    APPLE("애플"),
+}
+
+enum class UserStatus { REGISTERED, PROFILE_SUBMITTED, ACTIVE }
+
+enum class UserRole(val displayName: String) { NORMAL("normal"), ADMIN("admin") }
+
+data class UserProfile(
+    val nickName: String,
+    val preferredRegion: Location,
+    val nativeLanguage: String,
+    val firstForeignLanguage: String?,
+    val profileImageKey: String,
+)
+```
+
+`User` ID는 `UserId` value class로 감싸며, 값 자체는 UUID v7이다. 자세한 내용은 [부록: UserId와 UUID7](#부록-userid와-uuid7)을 참고한다.
+
+---
+
+## 4. OAuth2SuccessHandler — 로그인 완료 처리
+
+**`infra/configuration/OAuth2SuccessHandler.kt`**
+
+Spring OAuth2 인증이 완료되면 이 핸들러가 호출된다. 도메인 `User`를 꺼내 세션을 생성하고, JWT를 발급해 HttpOnly 쿠키로 내려보낸다.
+
+```kotlin
+@Component
+class OAuth2SuccessHandler(
+    private val jwtSigner: EcJwtSigner,
+    @UserJwt private val jwtProperties: JwtProperties,
+    private val sessionManager: SessionManager,
+) : SimpleUrlAuthenticationSuccessHandler() {
+
+    override fun onAuthenticationSuccess(...) {
+        val user = (authentication.principal as AuthenticatedUser).user
+
+        val session = Session.generate(SessionStore(user.id.value, UserRole.NORMAL))
+
+        // 만료된 고아 세션 정리 (NORMAL 유저 전략)
+        sessionManager.cleanSessions(session.sessionStore)
+
+        val accessToken = jwtSigner.buildToken(
+            subject = user.id.value.toString(),
+            expiration = jwtProperties.expiration,
+            claims = mapOf("type" to "access", "sessionId" to session.id.toString(), "role" to "normal"),
+        )
+        val refreshToken = jwtSigner.buildToken(
+            subject = user.id.value.toString(),
+            expiration = jwtProperties.refreshExpiration,
+            claims = mapOf("type" to "refresh", "sessionId" to session.id.toString(), "role" to "normal"),
+        )
+
+        sessionManager.saveSession(session, refreshToken, jwtProperties.refreshExpiration)
+
+        response.addHeader(SET_COOKIE, buildCookie("accessToken", accessToken, path = "/").toString())
+        response.addHeader(SET_COOKIE, buildCookie("refreshToken", refreshToken, path = "/auth").toString())
+        response.status = SC_OK
+    }
+}
+```
+
+#### HttpOnly Cookie를 선택한 이유
+
+클라이언트가 React Native + WebView 조합이기 때문이다.
+
+RN WebView는 OS 네이티브 쿠키 저장소(`CookieManager`)를 공유한다. 서버가 `Set-Cookie`로 내려보낸 쿠키는 WebView가 자동으로 보관하고, 이후 요청마다 자동으로 첨부한다. 앱 코드에서 토큰을 직접 읽거나 저장할 필요가 없다.
+
+`Authorization: Bearer` 방식이었다면 WebView에서 JS로 토큰을 꺼내 헤더에 직접 주입해야 하는데, 이는 XSS 공격에 토큰이 노출될 수 있는 경로가 된다. `HttpOnly` 쿠키는 JS에서 접근 자체가 불가능하다.
+
+```
+RN WebView                       Spring Server
+   |                                  |
+   |  GET /oauth2/authorization/kakao |
+   |─────────────────────────────────>|
+   |                                  |  (카카오 인증 완료)
+   |  Set-Cookie: accessToken=...     |
+   |<─────────────────────────────────|
+   |                                  |
+   |  이후 모든 요청 — 쿠키 자동 첨부  |
+   |─────────────────────────────────>|
+```
+
+`refreshToken`의 `Path=/auth` 제한도 같은 맥락이다. 갱신 엔드포인트 이외의 요청에는 refresh token이 실려가지 않도록 범위를 최소화한다.
+
+#### CSRF 취약점 — 현재 임시 비활성화
+
+`HttpOnly`는 JS가 쿠키를 **읽지 못하게** 막는 것이지, 브라우저가 쿠키를 **보내는 것**을 막지는 않는다. 악의적인 페이지가 서버로 요청을 유도하면 브라우저는 쿠키를 자동으로 첨부한다. 이것이 CSRF다.
+
+```
+악성 사이트                       Spring Server
+   |                                  |
+   |  <form action="https://api/..."> |
+   |  자동 submit                      |  ← 브라우저가 accessToken 쿠키 자동 첨부
+   |─────────────────────────────────>|  ← 서버 입장에서는 정상 요청처럼 보임
+```
+
+현재는 Spring Security의 CSRF 보호를 **임시로 비활성화**한 상태다. 서비스가 구현 중이라 실 데이터가 없고, localhost에서 프론트엔드와 함께 개발해야 하는 시점이라 우선 꺼뒀다. 프로덕션 배포 전에 활성화할 예정이다.
+
+```kotlin
+// SecurityConfig — 현재 비활성화
+http {
+    csrf { disable() }
+}
+```
+
+`SameSite=Lax`(현재 설정값)가 부분적인 완화를 제공한다. 외부 사이트에서 유발된 GET 요청에는 쿠키를 첨부하지 않는다. 그러나 `<form>` POST나 `fetch`에는 효과가 없어 완전한 대응이 아니다.
+
+| 방식 | 완화 수준 | 비고 |
+|------|----------|------|
+| `SameSite=Strict` | 강함 | 외부 링크 타고 온 GET도 차단 — OAuth2 redirect 흐름 깨짐 |
+| `SameSite=Lax` | 중간 | 현재 설정. 외부 GET은 허용, POST는 차단 안 됨 |
+| CSRF 토큰 (Double Submit Cookie) | 강함 | 비-HttpOnly 쿠키로 토큰 내려보내고 JS가 헤더에 복사 — 추후 도입 예정 |
+
+세션 관리 전략(`cleanSessions`)과 JWT 발급 인프라 상세는 [JWT 발급 및 세션 관리](/posts/jwt-session-management)를 참고한다.
+
+---
+
+## 5. 환경 변수 및 설정
+
+**`application.yml`**
+
+```yaml
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          kakao:
+            client-id: ${KAKAO_CLIENT_ID}
+            client-secret: ${KAKAO_CLIENT_SECRET}
+            redirect-uri: "{baseUrl}/login/oauth2/code/kakao"
+            authorization-grant-type: authorization_code
+            client-authentication-method: client_secret_post
+        provider:
+          kakao:
+            authorization-uri: ${KAKAO_AUTH_URI}
+            token-uri: ${KAKAO_TOKEN_URI}
+            user-info-uri: ${KAKAO_USER_INFO_URI}
+            user-name-attribute: id   # 응답 JSON에서 유저 식별자 필드명
+
+jwt:
+  public-key: ${JWT_PUBLIC_KEY}
+  private-key: ${JWT_PRIVATE_KEY}
+  expiration: 1800000         # 30분 (ms)
+  refresh-expiration: 604800000  # 7일 (ms)
+
+cookie:
+  secure: true
+  same-site: Lax
+```
+
+| 환경 변수 | 값 |
+|---|---|
+| `KAKAO_AUTH_URI` | `https://kauth.kakao.com/oauth/authorize` |
+| `KAKAO_TOKEN_URI` | `https://kauth.kakao.com/oauth/token` |
+| `KAKAO_USER_INFO_URI` | `https://kapi.kakao.com/v2/user/me` |
+
+카카오 개발자 콘솔에서 `client_secret_post` 방식을 활성화해야 하고, redirect URI(`{baseUrl}/login/oauth2/code/kakao`)를 허용 목록에 등록해야 한다.
+
+---
+
+## 6. 전체 시퀀스
+
+```
+[1] 클라이언트 → GET /oauth2/authorization/kakao
+      Spring이 카카오 인가 URL로 redirect
+
+[2] 카카오 → GET /login/oauth2/code/kakao?code=AUTH_CODE
+      Spring이 code → access token 교환 (client_secret_post)
+
+[3] Spring → KakaoOAuth2UserService.loadUser()
+      DefaultOAuth2UserService: GET https://kapi.kakao.com/v2/user/me
+      attributes["id"] = 카카오 숫자 유저 ID
+      UserRepository.findByProvider(providerId, KAKAO)
+        ├─ 있음 → 기존 User 반환
+        └─ 없음 → User.register() → 저장 → REGISTERED 상태
+
+[4] Spring → OAuth2SuccessHandler.onAuthenticationSuccess()
+      Session.generate(SessionStore(userId, NORMAL))
+      sessionManager.cleanSessions()
+      accessToken / refreshToken 발급 (ES256 JWT)
+      sessionManager.saveSession() → Redis 저장
+      응답: Set-Cookie accessToken (Path=/), refreshToken (Path=/auth)
+
+[5] 이후 요청
+      JwtAuthenticationFilter: accessToken 쿠키 검증 → SecurityContext 세팅
+```
+
+---
+
+## 핵심 설계 포인트
+
+| 항목 | 선택 | 이유 |
+|---|---|---|
+| 토큰 전달 방식 | HttpOnly Cookie | RN WebView는 OS 쿠키 저장소를 공유해 자동 첨부 — JS 접근 불가로 XSS 대응도 겸함 |
+| OAuthProvider 조회 | `(providerId, provider)` 복합 조회 | 같은 숫자 ID가 다른 플랫폼(애플)과 충돌하지 않도록 |
+| 신규 유저 상태 | `REGISTERED` | 프로필 미제출 상태를 명시적으로 구분해 온보딩 흐름 제어 |
+
+---
+
+## 부록: UserId와 UUID7
+
+### UserId — @JvmInline value class
+
+`UserId`는 `UUID`를 감싸는 인라인 값 클래스다.
+
+```kotlin
+@JvmInline
+value class UserId(val value: UUID) {
+    companion object {
+        fun generate() = UserId(UuidGenerator.generate())
+        fun of(value: UUID) = UserId(value)
+    }
+}
+```
+
+`@JvmInline value class`는 런타임에 래퍼 객체가 생성되지 않는다. JVM 바이트코드에서 `UserId`는 내부 `UUID`로 직접 인라인된다. 타입 안전성은 컴파일 타임에만 존재하고, 실행 비용은 `UUID`와 동일하다.
+
+일반 `UUID`를 그대로 쓰면 여러 Aggregate의 ID를 파라미터로 받는 메서드에서 실수로 순서를 바꿔도 컴파일 에러가 나지 않는다.
+
+```kotlin
+// UUID만 사용 시 — 컴파일러가 잡지 못함
+fun findParticipant(userId: UUID, roomId: UUID) { ... }
+findParticipant(roomId, userId)  // 실수해도 통과
+
+// value class 사용 시 — 타입 불일치로 컴파일 에러
+fun findParticipant(userId: UserId, roomId: ChatRoomId) { ... }
+findParticipant(roomId, userId)  // 컴파일 에러
+```
+
+#### Boxing이 발생하는 경우
+
+인라인은 항상 보장되지 않는다. 아래 세 가지 상황에서는 컴파일러가 `UserId` 래퍼 객체를 생성한다.
+
+```kotlin
+// 1. Nullable
+val id: UserId? = null
+
+// 2. 제네릭 타입 파라미터로 전달
+val ids: List<UserId> = listOf(...)
+fun <T> process(value: T) { ... }
+process(userId)                     // T로 추론 → 박싱
+
+// 3. 인터페이스 타입으로 참조
+interface Identifiable
+@JvmInline value class UserId(...) : Identifiable
+val i: Identifiable = userId        // 업캐스트 시 박싱
+```
+
+일반적인 도메인 레이어 사용(파라미터, 반환값, 로컬 변수)에서는 박싱이 발생하지 않으므로 실질적인 성능 비용은 없다.
+
+#### Kotlin 이름 맹글링
+
+value class를 파라미터로 받는 함수는 JVM 시그니처에서 이름이 변경된다. Java 상호운용이나 리플렉션 사용 시 영향을 받는다.
+
+```kotlin
+fun login(userId: UserId) { ... }
+// JVM 바이트코드: login-<hash>(UUID userId)
+// Java에서 호출 불가 (이름에 '-' 포함)
+```
+
+Java 상호운용이 필요한 메서드에는 `@JvmName`으로 별칭을 부여하거나 파라미터를 `UUID`로 받도록 오버로드한다.
+
+#### JPA 레이어에서의 변환
+
+JPA Entity에서는 `UUID`를 그대로 사용하고, Mapper에서 변환한다.
+
+```kotlin
+// JPA Entity — 순수 UUID 컬럼
+@Entity
+class UserJpaEntity(@Id val id: UUID, ...)
+
+// Mapper — 도메인 ↔ JPA 변환 시점에 UserId 감싸기/풀기
+fun User.toJpaEntity() = UserJpaEntity(id = id.value, ...)
+fun UserJpaEntity.toDomainEntity() = User.reconstitute(id = UserId.of(id), ...)
+```
+
+---
+
+### UUID7 — 시간 정렬 가능한 ID
+
+`UuidGenerator`는 `java-uuid-generator` 라이브러리의 `timeBasedEpochGenerator`를 사용한다. 이것이 UUID v7(UUIDv7)이다.
+
+```kotlin
+// shared/UuidGenerator.kt
+object UuidGenerator {
+    private val generator = Generators.timeBasedEpochGenerator()
+    fun generate(): UUID = generator.generate()
+}
+```
+
+```toml
+# libs.versions.toml
+uuid-generator = "5.2.0"
+uuid-generator = { module = "com.fasterxml.uuid:java-uuid-generator", ... }
+```
+
+#### 128비트 구조 (RFC 9562)
+
+```
+xxxxxxxx-xxxx-7xxx-yxxx-xxxxxxxxxxxx
+|_____________| |_| |_|  |__________|
+  unix_ts_ms   ver rand_a   rand_b
+   (48 bit)   (4b)(12 bit) (62 bit)
+```
+
+| 필드 | 비트 | 설명 |
+|------|------|------|
+| `unix_ts_ms` | 48 | Unix epoch 밀리초 타임스탬프 |
+| `ver` | 4 | 버전 필드 — 항상 `0111` (7) |
+| `rand_a` | 12 | 같은 밀리초 내 단조성을 위한 시퀀스 카운터 |
+| `var` | 2 | 배리언트 필드 — 항상 `10` (RFC 4122) |
+| `rand_b` | 62 | 랜덤 비트 |
+
+#### B-Tree 인덱스와 단편화
+
+UUID v4는 완전히 랜덤이라 새로 삽입되는 행이 B-Tree 인덱스의 임의 위치에 들어간다. 페이지 분할이 빈번하게 발생하고 인덱스 단편화가 심해진다.
+
+UUID v7은 앞 48비트가 밀리초 단위 Unix timestamp다. 시간순으로 단조 증가하므로 새 행이 항상 인덱스의 끝에 추가된다. PK 인덱스 단편화가 거의 없고, `ORDER BY created_at` 없이 ID 정렬만으로 생성 순서를 근사할 수 있다.
+
+```
+UUID v4: 550e8400-e29b-41d4-a716-446655440000  (완전 랜덤)
+UUID v7: 0190a8f2-3b1c-7abc-8def-123456789abc  (앞 12자리가 timestamp)
+          ^^^^^^^^^^^^
+          밀리초 단위 Unix timestamp — 시간순 정렬 보장
+```
+
+#### 동일 밀리초 내 단조성
+
+`timeBasedEpochGenerator`는 같은 밀리초에 여러 ID를 생성할 때 `rand_a` 필드를 시퀀스 카운터로 사용한다. 카운터가 오버플로우하면 타임스탬프를 1밀리초 앞당겨 단조 증가를 유지한다.
+
+```kotlin
+// 같은 밀리초에 생성해도 순서가 보장됨
+val id1 = UuidGenerator.generate()  // 0190a8f2-3b1c-7000-...
+val id2 = UuidGenerator.generate()  // 0190a8f2-3b1c-7001-...
+val id3 = UuidGenerator.generate()  // 0190a8f2-3b1c-7002-...
+//                              ^^^
+//                              rand_a 시퀀스 증가
+```
+
+`generator`는 `object` 싱글턴이며 내부적으로 스레드 안전하게 구현되어 있어 별도 동기화 없이 멀티스레드 환경에서 사용할 수 있다.
+
+`UserId`, `AdminId` 등 모든 Aggregate ID가 같은 `UuidGenerator.generate()`를 통해 생성된다.
