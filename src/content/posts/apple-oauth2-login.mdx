@@ -1,0 +1,286 @@
+---
+author: 허진수
+pubDatetime: 2026-07-05T14:00:00.000Z
+title: Spring Security + 애플 로그인 구현 (OIDC + client_secret JWT)
+slug: apple-oauth2-login
+featured: false
+tags:
+  - spring
+  - oauth2
+  - apple
+  - oidc
+  - kotlin
+  - security
+description: 애플 로그인의 OIDC 흐름, client_secret JWT 동적 생성, 카카오 OAuth2와의 구조 비교 정리
+---
+
+## 전체 흐름 요약
+
+```
+클라이언트 → /oauth2/authorization/apple
+         → (애플 동의 화면)
+         → /login/oauth2/code/apple?code=...
+         → AppleOauthConfig: code + client_secret JWT → 애플 토큰 서버
+         → AppleOauthUserService (유저 조회/생성)
+         → OAuth2SuccessHandler (JWT 발급 + Redis 세션 저장)
+         → Set-Cookie: accessToken / refreshToken
+```
+
+---
+
+## 카카오와의 핵심 차이
+
+애플 로그인은 카카오와 달리 **OIDC(OpenID Connect)** 프로토콜을 사용한다. 두 가지 큰 차이가 있다.
+
+### 1. 유저 정보 조회 방식
+
+카카오는 액세스 토큰을 받은 후 유저 정보 엔드포인트(`/v2/user/me`)를 별도로 호출한다. 애플은 토큰 교환 응답에 **ID Token(JWT)** 이 포함되어 있고, 유저 식별자(`sub`)가 그 안에 들어있다. 별도 API 호출 없이 ID Token을 파싱하는 것만으로 유저를 식별한다.
+
+| 항목 | 카카오 (OAuth2) | 애플 (OIDC) |
+|------|----------------|------------|
+| 유저 서비스 | `OAuth2UserService` | `OidcUserService` |
+| 유저 정보 취득 | 유저 정보 API 별도 호출 | ID Token (`sub` claim) 파싱 |
+| `user-name-attribute` | `id` | `sub` |
+| Spring 처리 클래스 | `DefaultOAuth2UserService` | `OidcUserService` |
+
+### 2. client_secret 방식
+
+카카오는 개발자 콘솔에서 발급받은 **고정 문자열**을 `client_secret`으로 사용한다. 애플은 `client_secret`을 **요청마다 동적으로 생성한 JWT**로 제출해야 한다. 이 JWT는 개발자 계정의 EC private key로 ES256 서명된다.
+
+---
+
+## 1. client_secret JWT 동적 생성
+
+### AppleJwtProperties
+
+```kotlin
+@ConfigurationProperties(prefix = "apple.jwt")
+data class AppleJwtProperties(
+    val keyId: String,       // Apple Developer 키 ID (JWT header kid)
+    val teamId: String,      // Apple Developer 팀 ID (JWT iss)
+    val clientId: String,    // 앱 Bundle ID / Service ID (JWT sub)
+    val privateKey: String,  // .p8 파일의 EC private key
+    val audience: String,    // "https://appleid.apple.com"
+    override val expiration: Long,
+    override val refreshExpiration: Long,
+) : JwtProperties
+```
+
+### AppleJwtSigner
+
+`EcJwtSigner`를 상속해 Apple용 private key로 ES256 서명기를 구성한다. 사용자 JWT 발급에 쓰는 `EcJwtSigner`와 동일한 인프라를 재사용한다.
+
+```kotlin
+@Component("appleJwtSigner")
+class AppleJwtSigner(
+    appleJwtProperties: AppleJwtProperties,
+) : EcJwtSigner() {
+    private val privateKey = loadPrivateKey(appleJwtProperties.privateKey)
+    override val signer = ECDSASigner(privateKey)
+}
+```
+
+### client_secret JWT 구조
+
+애플이 요구하는 `client_secret` JWT의 클레임 구성은 다음과 같다.
+
+```
+Header: { "alg": "ES256", "kid": "<APPLE_KEY_ID>" }
+
+Claims:
+  iss  = Team ID          (Apple Developer 팀 식별자)
+  sub  = Client ID        (앱 Bundle ID)
+  aud  = "https://appleid.apple.com"
+  iat  = 발급 시각
+  exp  = 만료 시각 (최대 6개월, 현재 설정: 600ms)
+```
+
+### AppleOauthConfig — 토큰 요청 인터셉트
+
+Spring Security의 기본 토큰 교환 클라이언트에 파라미터 변환기를 추가해, apple 등록 ID의 요청에만 동적으로 생성한 `client_secret` JWT를 주입한다.
+
+```kotlin
+@Configuration
+class AppleOauthConfig(
+    private val appleJwtSigner: AppleJwtSigner,
+    private val appleJwtProperties: AppleJwtProperties,
+) {
+    @Bean
+    fun authorizationCodeAccessTokenResponseClient()
+        : OAuth2AccessTokenResponseClient<OAuth2AuthorizationCodeGrantRequest> {
+        return RestClientAuthorizationCodeTokenResponseClient().apply {
+            addParametersConverter { grantRequest ->
+                if (grantRequest.clientRegistration.registrationId == "apple") {
+                    LinkedMultiValueMap<String, String>().apply {
+                        set("client_secret", appleJwtSigner.buildToken(
+                            subject  = appleJwtProperties.clientId,
+                            exp      = appleJwtProperties.expiration,
+                            claims   = null,
+                            keyId    = appleJwtProperties.keyId,
+                            issuer   = appleJwtProperties.teamId,
+                            audience = appleJwtProperties.audience,
+                        ))
+                    }
+                } else {
+                    LinkedMultiValueMap()
+                }
+            }
+        }
+    }
+}
+```
+
+카카오 요청(`registrationId != "apple"`)에는 빈 맵을 반환해 기존 흐름을 그대로 유지한다.
+
+---
+
+## 2. AppleOauthUserService — 유저 조회/생성
+
+**`infra/external/AppleOauthUserService.kt`**
+
+```kotlin
+@Service
+class AppleOauthUserService(
+    private val userRepository: UserRepository,
+) : OidcUserService() {
+
+    internal var delegate: OidcUserService = OidcUserService()
+
+    override fun loadUser(userRequest: OidcUserRequest?): OidcUser {
+        val oidcUser = delegate.loadUser(userRequest)  // ID Token 파싱
+
+        val providerId = oidcUser.subject  // ID Token의 sub claim
+
+        val user = userRepository.findByProvider(providerId, OAuthProvider.APPLE)
+            ?: userRepository.save(User.register(OAuthProvider.APPLE, providerId))
+
+        return OidcUserAdapter(user, oidcUser)
+    }
+}
+```
+
+카카오의 `KakaoOAuth2UserService`와 구조가 거의 같다. 차이는 두 가지다.
+
+- 상속: `OAuth2UserService` → `OidcUserService`
+- `providerId` 취득: `attributes["id"]` → `oidcUser.subject`
+
+`OidcUserService.loadUser()`는 내부적으로 ID Token 서명을 검증하고 클레임을 파싱한다. 유저 정보 API를 별도로 호출하지 않는다.
+
+### OidcUserAdapter
+
+```kotlin
+class OidcUserAdapter(
+    override val user: User,
+    private val oidcUser: OidcUser,
+) : OidcUser by oidcUser, AuthenticatedUser {
+    override fun getName() = user.id.value.toString()
+    override fun getAuthorities() = listOf(SimpleGrantedAuthority("ROLE_USER"))
+}
+```
+
+카카오의 `OAuth2UserAdapter`와 역할이 같다. `OidcUser`를 델리게이트로 두고 `AuthenticatedUser`를 함께 구현해 `OAuth2SuccessHandler`에서 도메인 `User`를 꺼낼 수 있게 한다.
+
+---
+
+## 3. SecurityConfig 연결
+
+```kotlin
+oauth2Login {
+    userInfoEndpoint {
+        userService    = kakaoOAuth2UserService   // 카카오: OAuth2UserService
+        oidcUserService = appleOauthUserService   // 애플: OidcUserService
+    }
+    authenticationSuccessHandler = oAuth2SuccessHandler
+}
+```
+
+Spring Security는 `registrationId`에 따라 자동으로 올바른 서비스를 선택한다. `OAuth2SuccessHandler`는 카카오/애플 구분 없이 동일하게 동작한다.
+
+---
+
+## 4. 환경 변수 및 설정
+
+```yaml
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          apple:
+            client-id: ${APPLE_CLIENT_ID}          # Bundle ID / Service ID
+            client-secret: ${APPLE_CLIENT_SECRET}  # 더미값 (실제로는 동적 생성)
+            redirect-uri: "{baseUrl}/login/oauth2/code/apple"
+            authorization-grant-type: authorization_code
+            client-authentication-method: client_secret_post
+        provider:
+          apple:
+            authorization-uri: ${APPLE_AUTH_URI}   # https://appleid.apple.com/auth/authorize
+            token-uri: ${APPLE_TOKEN_URI}           # https://appleid.apple.com/auth/token
+            user-info-uri: ${APPLE_USER_INFO_URI}   # https://appleid.apple.com/auth/userinfo
+            user-name-attribute: sub                # ID Token의 유저 식별자 필드
+
+apple:
+  jwt:
+    key-id: ${APPLE_KEY_ID}       # Apple Developer Console에서 발급한 키 ID
+    team-id: ${APPLE_TEAM_ID}     # Apple Developer 팀 ID
+    client-id: ${APPLE_CLIENT_ID} # Bundle ID
+    private-key: ${APPLE_PRIVATE_KEY}  # .p8 파일 내용 (개행 이스케이프)
+    audience: "https://appleid.apple.com"
+    expiration: 600
+    refresh-expiration: 180000
+```
+
+`client-secret`에는 더미값을 넣어도 된다. `AppleOauthConfig`의 파라미터 변환기가 실제 요청 직전에 동적으로 생성한 JWT로 덮어쓴다.
+
+### Apple Developer Console 설정
+
+| 항목 | 설명 |
+|------|------|
+| Services ID | `client-id`로 사용. `com.example.app` 형태 |
+| Keys | ES256 private key (.p8) 발급 — 1회만 다운로드 가능 |
+| Key ID | 발급된 키의 10자리 식별자 → `key-id` |
+| Team ID | 개발자 계정 팀 ID (우측 상단) → `team-id` |
+| Redirect URI | `{baseUrl}/login/oauth2/code/apple` 등록 필요 |
+
+---
+
+## 5. 전체 시퀀스
+
+```
+[1] 클라이언트 → GET /oauth2/authorization/apple
+      Spring이 애플 인가 URL로 redirect
+
+[2] 애플 → GET /login/oauth2/code/apple?code=AUTH_CODE
+      Spring이 code 수신
+
+[3] AppleOauthConfig (파라미터 변환기)
+      AppleJwtSigner.buildToken() → client_secret JWT 생성 (ES256)
+      POST https://appleid.apple.com/auth/token
+        code=AUTH_CODE
+        client_id=<Bundle ID>
+        client_secret=<동적 생성 JWT>
+      응답: { access_token, id_token (JWT) }
+
+[4] Spring → AppleOauthUserService.loadUser()
+      OidcUserService: ID Token 서명 검증 + sub 클레임 추출
+      UserRepository.findByProvider(sub, APPLE)
+        ├─ 있음 → 기존 User 반환
+        └─ 없음 → User.register() → 저장 → REGISTERED 상태
+
+[5] Spring → OAuth2SuccessHandler.onAuthenticationSuccess()
+      (카카오와 동일한 흐름)
+      Session.generate() → cleanSessions() → JWT 발급 → Redis 저장
+      응답: Set-Cookie accessToken / refreshToken
+```
+
+---
+
+## 핵심 설계 포인트
+
+| 항목 | 선택 | 이유 |
+|------|------|------|
+| OIDC 사용 | `OidcUserService` | 애플은 ID Token으로 유저 정보를 제공 — 별도 API 호출 불필요 |
+| client_secret | 요청마다 동적 JWT 생성 | 애플 정책상 고정 문자열 불가, ES256 서명 JWT를 직접 발급해야 함 |
+| `EcJwtSigner` 재사용 | 사용자 JWT · Apple client_secret JWT 공용 | 동일한 ES256 서명 인프라, 키만 다름 |
+| `providerId` | `oidcUser.subject` (`sub`) | OIDC 표준 유저 식별자, 애플이 유일하게 보장하는 식별자 |
+| 성공 핸들러 공유 | `OAuth2SuccessHandler` 단일 사용 | 카카오/애플 모두 `AuthenticatedUser`를 구현하므로 분기 불필요 |
