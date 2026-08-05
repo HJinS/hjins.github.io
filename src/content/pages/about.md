@@ -1,37 +1,14 @@
 ---
 title: "About"
-description: "A bit about me and this blog."
+description: "까먹지 않기 위해 기록하는 블로그"
 ---
 
-AstroPaper is a minimal, accessible and SEO-friendly blog theme built with [Astro](https://astro.build/) and [Tailwind CSS](https://tailwindcss.com/).
+## 👋 소개
+안녕하세요
+백엔드 개발 및 DevOps, SRE 엔지니어링에 관심이 많은 쓰니입니다.
+이 블로그에서는 실무에서 유용할 만한 내용들을 잊지 않기 위해 틈틈히 정리하려고 합니다.
 
-![Astro Paper](@/assets/images/astropaper-og.jpg)
-
-AstroPaper provides a solid foundation for blogs, or even portfolios\_ with full markdown support, built-in dark mode, and a clean layout that works out-of-the-box.
-
-The blog posts in this theme also serve as guides, docs or example articles\_ making AstroPaper a flexible starting point for your next content-driven site.
-
-## Features
-
-AstroPaper comes with a set of useful features that make content publishing easy and effective:
-
-- SEO-friendly
-- Fast performance
-- Light & dark mode
-- Highly customizable
-- Organizable blog posts
-- Responsive & accessible
-- Static search with [PageFind](https://pagefind.app/)
-- Automatic social image generation
-
-and so much more.
-
-## Show your support
-
-If you like [AstroPaper](https://github.com/satnaing/astro-paper), consider giving it a star ⭐️.
-
-Found a bug 🐛 or have an improvement ✨ in mind? Feel free to open an [issue](https://github.com/satnaing/astro-paper/issues), submit a [pull request](https://github.com/satnaing/astro-paper/pulls) or start a [discussion](https://github.com/satnaing/astro-paper/discussions).
-
-If you find this theme helpful, you can also [sponsor me on GitHub](https://github.com/sponsors/satnaing) or [buy me a coffee](https://buymeacoffee.com/satnaing) to show your support — every penny counts.
-
-Kyay zuu! 🙏🏼
+## 📮 연락처
+- github: https://github.com/HJinS
+- emaiL: windowed@naver.com
+- linkedIn: https://www.linkedin.com/in/hjins/
