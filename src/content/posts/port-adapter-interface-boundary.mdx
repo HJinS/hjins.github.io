@@ -1,0 +1,109 @@
+---
+author: 허진수
+pubDatetime: 2026-09-04T02:00:00.000Z
+title: Port/Adapter 인터페이스, 외부와의 연결
+slug: port-adapter-interface-boundary
+featured: false
+tags:
+  - spring
+  - kotlin
+  - ddd
+  - architecture
+description: DDD에서 외부와의 연같을 다루는 방법과, 인터페이스 유무를 결정 짓는 방법
+---
+
+## 개요
+
+회원탈퇴 기능을 만들면서 인프라 컴포넌트 두 개를 거의 동시에 설계했다.
+
+- KMS로 애플 refresh_token을 암복호화하는 `TokenEncryptor` — 인터페이스 없이 구체 클래스(`KmsEncryptor`)만 만들었다.
+- 소셜 unlink를 비동기로 실행하는 `SocialUnlinkRunnerPort` — 인터페이스를 만들고 `app/port`에 뒀다.
+
+둘 다 "infra에 있는 기술적 컴포넌트"라는 점은 같은데 결과가 반대다. 이 글은 그 판단 기준을 정리한다.
+
+---
+
+## 1. 인터페이스 생략 - `TokenEncryptor`
+
+`TokenEncryptor`(KMS 암복호화)를 쓰는 곳은 두 곳이다.
+
+```
+AppleTokenCapturingAuthorizedClientRepository (infra/configuration)
+  -> tokenEncryptor.encrypt(refreshToken)
+
+AppleUnlinkAdapter (infra/external)
+  -> tokenEncryptor.decrypt(credential.encryptedRefreshToken)
+```
+
+둘 다 같은 **infra 레이어**다.
+
+> DDD 레이어드 아키텍처에서 인터페이스(포트)가 필요한 근본 이유는 "app이 infra의 구체적인 구현을 몰라야 한다"는 방향성 때문인데, 여기는 애초에 app이 끼어들 자리가 없다.
+>
+> infra가 infra를 직접 참조하는 건 레이어 위반이 아니다.
+
+```kotlin
+// infra/external/KmsEncryptor.kt — 인터페이스 없음
+@Component
+@ConditionalOnProperty(name = ["aws.kms.key-id"])
+class KmsEncryptor(
+    private val kmsClient: KmsClient,
+    private val kmsProperties: KmsProperties,
+) {
+    fun encrypt(plainText: String): String { ... }
+    fun decrypt(cipherText: String): String { ... }
+}
+```
+
+---
+
+## 2. 인터페이스가 생성 - `SocialUnlinkRunnerPort`
+
+반대로 소셜 unlink를 비동기로 실행하는 컴포넌트는 **app 레이어(`WithdrawService`)가 직접 호출**한다.
+
+```kotlin
+@Service
+class WithdrawService(
+    private val unlinkRunner: SocialUnlinkRunnerPort,   // 인터페이스
+    ...
+) : WithdrawUseCase {
+    override fun execute(command: WithdrawUser) {
+        ...
+        unlinkRunner.unlinkAsync(user.provider, user.providerId)
+        ...
+    }
+}
+```
+
+`WithdrawService`가 구현체(`SocialUnlinkRunnerAdapter`, 내부적으로 `@Async` + `SocialUnlinkResolver` + WebClient 어댑터들을 조합)를 직접 알게 되면, app 레이어가 infra의 실행 방식(스레드풀, 어떤 provider 어댑터를 쓰는지)에 종속된다.
+
+그래서 여기는 명확하게 `app/port`에 인터페이스를 두고, infra 구현체는 그 뒤에 숨겼다.
+
+```kotlin
+// app/port/SocialUnlinkRunnerPort.kt
+interface SocialUnlinkRunnerPort {
+    fun unlinkAsync(provider: OAuthProvider, providerId: String)
+}
+
+// infra/external/SocialUnlinkRunnerAdapter.kt
+@Component
+class SocialUnlinkRunnerAdapter(
+    private val resolver: SocialUnlinkResolver,
+) : SocialUnlinkRunnerPort {
+    @Async
+    override fun unlinkAsync(provider: OAuthProvider, providerId: String) { ... }
+}
+```
+
+---
+
+## 판단 기준
+
+| 컴포넌트 | 호출하는 쪽 | 인터페이스 필요 여부 |
+|---|---|---|
+| `TokenEncryptor`/`KmsEncryptor` | infra ← infra | 불필요 (레이어 경계 없음, 테스트 편의만 남음) |
+| `SocialUnlinkRunnerPort` | app ← infra | 필요 (app이 infra 구현을 몰라야 함) |
+| `SocialUnlinkResolver` (수정 전) | app ← infra | 필요했는데 놓쳤던 사례 |
+
+기준은 결국 하나다
+- **"이걸 부르는 쪽이 app/domain 레이어인가, 아니면 같은 infra 레이어인가."** 인터페이스는 항상 만드는 게 기본값이 아니라, 실제로 넘어야 하는 레이어 경계가 있을 때만 만든다.
+- 경계가 없는데도 습관적으로 포트를 뽑으면 불필요한 간접 계층만 늘어난다.

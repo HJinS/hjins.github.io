@@ -1,0 +1,188 @@
+---
+author: 허진수
+pubDatetime: 2026-09-04T07:00:00.000Z
+title: "@TransactionalEventListener(AFTER_COMMIT) 제대로 쓰기 — 캐시 무효화부터 예외를 삼키는 함정까지"
+slug: transactional-event-listener-after-commit
+featured: false
+tags:
+  - spring
+  - kotlin
+  - event-driven
+  - cache
+  - redis
+description: 캐시 무효화를 도메인 이벤트로 하는 이유, 도메인 이벤트에 raw UUID를 쓰는 이유, 그리고 크로스모듈 정리 작업을 설계하다 발견한 AFTER_COMMIT 리스너의 예외 처리 함정
+---
+
+## 개요
+
+이 프로젝트는 캐시 무효화와 크로스모듈 데이터 정리 둘 다 `@TransactionalEventListener(phase = AFTER_COMMIT)`를 표준 패턴으로 쓴다.
+- 같은 메커니즘인데 용도가 다르다 보니, 여기에 정리한다.
+
+---
+
+## 1. 캐시 무효화를 왜 `@CacheEvict` 대신 이벤트로 하나
+
+```kotlin
+@Component("notificationUserProfileCacheEvictListener")
+class UserProfileCacheEvictListener(
+    private val cacheManager: CacheManager
+) {
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    fun on(event: UserProfileUpdated) {
+        cacheManager.getCache(CacheNames.NOTIFICATION_USER_NICKNAME)?.evict(event.userId.value)
+    }
+}
+```
+
+동기 `@CacheEvict`를 안 쓰는 이유는 명확하다
+> **트랜잭션이 롤백되면 캐시를 건드리면 안 된다.**
+> `@CacheEvict`는 트랜잭션 커밋 여부와 무관하게 메서드 실행 시점에 바로 캐시를 지우기 때문에, 저장은 롤백됐는데 캐시는 이미 비어있는(또는 반대로 stale한 값이 남아있는) 상황이 생길 수 있다.
+> `AFTER_COMMIT`은 커밋이 확정된 뒤에만 실행되니 이 문제가 없다.
+
+### 부가적인 이점 — 여러 모듈이 같은 이벤트를 각자 구독할 수 있다
+
+>프로필을 수정하는 `iam`의 서비스는 "캐시"라는 개념 자체를 모른다.
+>
+> DB를 갱신하고 `UserProfileUpdated`를 발행하는 게 전부다.
+>
+> 캐시를 지우는 일은 별도 리스너가 담당하는데, 이 프로필 정보를 캐싱하는 곳이 한 군데가 아니다.
+
+```kotlin
+// notification 모듈 — 알림 보낼 때 쓸 닉네임 캐시
+@Component("notificationUserProfileCacheEvictListener")
+class UserProfileCacheEvictListener(private val cacheManager: CacheManager) {
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    fun on(event: UserProfileUpdated) {
+        cacheManager.getCache(CacheNames.NOTIFICATION_USER_NICKNAME)?.evict(event.userId.value)
+    }
+}
+
+// communication 모듈 — 채팅 화면에 쓸 프로필 캐시, 완전히 별개로 구독
+@Component("communicationUserProfileCacheEvictListener")
+class CommunicationUserProfileCacheEvictListener(private val cacheManager: CacheManager) {
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    fun on(event: UserProfileUpdated) {
+        cacheManager.getCache(CacheNames.COMMUNICATION_USER_PROFILE)?.evict(event.userId.value)
+    }
+}
+```
+
+`notification`은 `NOTIFICATION_USER_NICKNAME` 캐시를, `communication`은 `COMMUNICATION_USER_PROFILE` 캐시를 각자 자기 목적에 맞게 따로 들고 있고, 같은 이벤트를 각자 독립적으로 구독해서 각자 지운다.
+- 만약 이걸 이벤트 없이 프로필 수정 서비스가 직접 `cacheManager.evict(...)`를 호출하는 방식이었다면, `iam`의 서비스가 "notification엔 이런 캐시가 있고 communication엔 저런 캐시가 있다"는 걸 전부 알고 있어야 하고, 나중에 다른 모듈이 프로필을 캐싱하기 시작할 때마다 `iam` 쪽 코드를 계속 고쳐야 한다.
+- 이벤트로 분리해두면 `iam`은 그 사실을 전혀 몰라도 되고, 새 모듈은 그냥 리스너 하나를 추가해서 알아서 구독하면 끝난다.
+
+### 자기호출(self-invocation) 주의
+
+같은 클래스 안에서 `@Cacheable` 메서드를 `this.xxx()`로 호출하면 프록시를 우회해서 캐싱이 안 먹는다
+- 이건 `@Transactional`/`@Async`와 완전히 같은 내용이다([관련 글](/posts/spring-self-invocation-requires-new)).
+- 이런 경우 캐싱 로직을 별도 컴포넌트로 분리해서 프록시를 거치도록 만든다.
+
+---
+
+## 2. 크로스모듈 정리에서 발견한 진짜 함정 — 예외를 삼킨다
+
+회원탈퇴 시 `UserWithdrawn` 이벤트를 `help`/`review`/`communication`이 각자 구독해서 자기 데이터를 정리하도록 설계하면서, "리스너가 실패하면 어떻게 아는가"라는 질문에 부딪혔다.
+
+- **`AFTER_COMMIT` 리스너에서 발생한 예외는 Spring이 로그만 남기고 호출자에게 전혀 전파하지 않는다.**
+- 처음엔 "커밋이 끝난 뒤라 롤백할 방법이 없어서 그런가 보다" 정도로만 짐작했는데, 실제로 Spring Framework 소스를 따라가보니 훨씬 구체적인 메커니즘이 있었다.
+
+`@TransactionalEventListener`는 내부적으로 raw `TransactionSynchronization`의 두 콜백 중 **`afterCommit()`이 아니라 `afterCompletion()`을 쓴다.** 이 둘은 예외 처리 방식이 다르다.
+
+`TransactionalApplicationListenerSynchronization`([source](https://github.com/spring-projects/spring-framework/blob/16edf9867a143f95cefadb7b2115dcbbf624e176/spring-tx/src/main/java/org/springframework/transaction/event/TransactionalApplicationListenerSynchronization.java#L108-L119))의 `PlatformSynchronization`이 `AFTER_COMMIT` phase를 실제로 처리하는 지점이다.
+
+```java
+// PlatformSynchronization (TransactionalApplicationListenerSynchronization 내부)
+@Override
+public void afterCompletion(int status) {
+    TransactionPhase phase = getTransactionPhase();
+    if (phase == TransactionPhase.AFTER_COMMIT && status == STATUS_COMMITTED) {
+        processEventWithCallbacks(); // 여기서 우리가 만든 리스너 메서드를 호출
+    }
+    ...
+}
+```
+
+> `processEventWithCallbacks()`는 리스너 메서드 실행 중 예외를 잡아서 옵저버빌리티용 콜백(`postProcessEvent`)을 실행한 뒤 **다시 던진다**(`throw ex`) — 여기까진 예외가 살아있다.
+
+```java
+public void processEventWithCallbacks() {
+    this.callbacks.forEach(callback -> callback.preProcessEvent(this.event));
+    try {
+        this.listener.processEvent(this.event);
+    }
+    catch (RuntimeException | Error ex) {
+        this.callbacks.forEach(callback -> callback.postProcessEvent(this.event, ex));
+        throw ex;
+    }
+    this.callbacks.forEach(callback -> callback.postProcessEvent(this.event, null));
+}
+```
+
+이 예외가 최종적으로 삼켜지는 지점은 `TransactionSynchronizationUtils.invokeAfterCompletion()`([source](https://github.com/spring-projects/spring-framework/blob/7635ac38f612c8eb6c7cdcbac999846a5761e535/spring-tx/src/main/java/org/springframework/transaction/support/TransactionSynchronizationUtils.java#L177-L188))이다.
+
+```java
+public static void invokeAfterCompletion(@Nullable List<TransactionSynchronization> synchronizations,
+        int completionStatus) {
+    if (synchronizations != null) {
+        for (TransactionSynchronization synchronization : synchronizations) {
+            try {
+                synchronization.afterCompletion(completionStatus);
+            }
+            catch (Throwable ex) {
+                logger.error("TransactionSynchronization.afterCompletion threw exception", ex);
+            }
+        }
+    }
+}
+```
+
+여기서 `catch (Throwable ex) { logger.error(...) }` — 로그만 남기고 끝이다.
+
+재미있는 건 **같은 파일의 `invokeAfterCommit()`은 이런 try-catch가 아예 없다** — raw `afterCommit()` 콜백에서 던진 예외는 실제로 호출자에게 전파된다([관련 GitHub 이슈](https://github.com/spring-projects/spring-framework/issues/28685)). 즉 "AFTER_COMMIT이라서 예외가 삼켜진다"가 아니라, **`@TransactionalEventListener`가 구현을 위해 `afterCompletion()`을 골라 썼기 때문에** 삼켜지는 것이다.
+
+이게 왜 문제가 되냐면, 배치가 "리스너 호출 후 예외 안 났으니 성공했다"고 판단할 방법이 없다는 뜻이다. 리스너 하나가 조용히 실패해도 배치는 정상 종료된 것처럼 보인다.
+
+```kotlin
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+fun on(event: HelpDeleted) {
+    chatRoomRepository.findAllByHelpId(event.helpId).forEach { room -> ... }
+}
+```
+
+### 그래서 완료추적을 따로 만들었다
+
+"리스너가 끝났는지"를 Spring 메커니즘에 기대는 대신, [Redis Set으로 명시적으로 추적](/posts/redis-vs-rdb-loss-risk)하기로 했다.
+
+---
+
+## 3. 도메인 이벤트 페이로드는 왜 raw UUID를 쓰나
+
+이 프로젝트는 ID를 `@JvmInline value class`로 감싸는 게 기본 컨벤션이다(`UserId`, `HelpId` 등). 그런데 도메인 이벤트만큼은 예외적으로 raw `UUID`를 쓴다.
+
+```kotlin
+// HelpDeleted — helpId가 HelpId가 아니라 UUID
+data class HelpDeleted(val helpId: UUID, override val occurredAt: Instant) : DomainEvent
+
+// UserWithdrawn도 동일
+data class UserWithdrawn(val userId: UUID, override val occurredAt: Instant) : DomainEvent
+```
+
+도메인 이벤트는 발행 모듈과 구독 모듈이 다른 경우가 많다(`iam`이 발행, `help`/`review`/`communication`이 구독). value class ID 타입(`UserId`, `HelpId`)은 각 모듈의 도메인 패키지 소속이라, 구독하는 쪽이 그 타입까지 정확히 알아야 하는 부담이 생긴다.
+
+이벤트 페이로드는 크로스모듈 통신 계약이라, 여기서만큼은 어느 모듈에서든 이견 없이 다룰 수 있는 원시 타입을 쓰는 게 실용적이다.
+
+도메인 이벤트 관련 컨벤션 하나 더 — **`registerEvent()`는 애그리거트 안에서, 발행(`publish()`)은 app 서비스가 명시적으로** 한다.
+
+```kotlin
+@Transactional
+override fun execute(command: BlockUser) {
+    val block = Block.create(...)
+    blockRepository.save(block)
+    domainEventPublisher.publish(block)   // 명시적 호출
+}
+```
+
+리포지토리의 `save()` 내부에서 몰래 발행하지 않는다
+- 이벤트 발행 시점과 트랜잭션 범위를 서비스 로직 옆에서 바로 볼 수 있어야 추적하기 쉽다.
+- `save()` 안에서 `ApplicationEventPublisher`를 직접 쓰고 있다면, 그건 이 컨벤션의 예외가 아니라 버그다.

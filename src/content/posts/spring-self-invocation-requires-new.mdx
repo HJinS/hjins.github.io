@@ -1,0 +1,163 @@
+---
+author: 허진수
+pubDatetime: 2026-09-04T01:00:00.000Z
+title: "@Transactional 함정"
+slug: spring-self-invocation-requires-new
+featured: false
+tags:
+  - spring
+  - kotlin
+  - transaction
+  - aop
+description: 회원탈퇴 처리에서 상태 전이를 별도 서비스로 쪼갠 이유, 그리고 이중 @Transactional이 REQUIRED 전파로 조용히 무력화됐던 버그를 REQUIRES_NEW로 고친 과정
+---
+
+## 개요
+
+회원탈퇴 처리 중 레이스 컨디션 하나를 막아야 했다
+- 탈퇴 처리가 진행되는 동안 동시에 들어온 `/auth/refresh` 요청이 세션을 갱신해버리면, 탈퇴 처리가 끝난 뒤에도 유효한 토큰이 하나 남는다.
+
+해법으로 잡은 건 "`User.status`를 `WITHDRAWN`으로 바꾸는 걸 **가장 먼저, 독립적으로 커밋**시키고, `/auth/refresh`가 그 상태를 확인해서 거부한다"는 것이었다.
+이 글은 그 "독립적으로 커밋"을 구현하다가 실제로 겪은 버그와, Spring `@Transactional`이 프록시 기반이라는 사실이 왜 이 문제의 핵심인지를 정리한다.
+
+---
+
+## 1. 왜 상태 전이를 별도 서비스로 쪼갰나
+
+```kotlin
+@Service
+class WithdrawService(
+    private val markUserWithdrawUseCase: MarkUserWithdrawUseCase,
+    // 세션 삭제, 재가입 마커, unlink, User 삭제 등...
+) : WithdrawUseCase {
+    override fun execute(command: WithdrawUser) {
+        val (user, withdrawnAt) = markUserWithdrawUseCase.execute(command.userId)
+        // 이후 세션 삭제, 재가입 마커 저장, unlink 디스패치, User 삭제...
+    }
+}
+```
+
+`WithdrawService.execute()`는 상태 전이 말고도 할 일이 많다
+- 세션 전체 삭제
+- 재가입 차단 마커 저장
+- 소셜 unlink 디스패치
+- 마지막엔 User row 삭제
+
+이 전체가 한 트랜잭션으로 묶여서 끝까지 가야 커밋된다면, `User.status = WITHDRAWN`이라는 사실도 그 전체가 끝날 때까지 다른 트랜잭션엔 안 보인다.
+
+그러면 애초에 "가장 먼저 커밋시켜서 동시 요청을 막는다"는 목적 자체가 성립하지 않는다.
+
+그래서 상태 전이만 담당하는 `MarkUserWithdrawService`를 별도 서비스로 뽑았다.
+
+```kotlin
+@Service
+class MarkUserWithdrawService(
+    private val userRepository: UserRepository,
+    private val domainEventPublisher: DomainEventPublisher,
+) : MarkUserWithdrawUseCase {
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    override fun execute(userId: UserId): Pair<User, Instant> {
+        val user = userRepository.findById(userId) ?: throw NotFoundException(IamErrorCode.USER_NOT_FOUND)
+        val withdrawnAt = Instant.now()
+        user.markWithdraw(withdrawnAt)
+        val savedUser = userRepository.save(user)
+        domainEventPublisher.publish(user)
+        return savedUser to withdrawnAt
+    }
+}
+```
+
+---
+
+## 2. 처음엔 `REQUIRES_NEW`를 안 썼다 — 그리고 조용히 무력화됐다
+
+처음 구현에선 `MarkUserWithdrawService.execute()`에 그냥 `@Transactional`만 붙였다. 컴파일도 되고, 테스트도 통과했다.
+
+문제는 `WithdrawService.execute()`에도 나중에 `@Transactional`이 붙었다는 것
+- 마지막에 추가한 `userRepository.delete(user)`가 트랜잭션 없이는 실행이 안 되니 자연스럽게 붙인 거였다.
+
+```kotlin
+@Service
+class WithdrawService(...) : WithdrawUseCase {
+    @Transactional   // ← 이게 나중에 추가됨
+    override fun execute(command: WithdrawUser) {
+        val (user, withdrawnAt) = markUserWithdrawUseCase.execute(command.userId)   // ①
+        ...
+        userRepository.delete(user)   // ②
+    }
+}
+```
+
+> 여기서 문제가 생긴다.
+> `@Transactional`의 기본 전파 옵션은 `Propagation.REQUIRED`다
+> -  "이미 진행 중인 트랜잭션이 있으면 새로 안 열고 거기 올라탄다"는 뜻이다.
+> - `WithdrawService.execute()`가 먼저 트랜잭션을 열고, 그 안에서 `MarkUserWithdrawUseCase.execute()`(다른 빈이라 프록시는 정상적으로 타지만)를 호출하면, `REQUIRED`는 "이미 트랜잭션이 있네, 거기 참여할게"로 동작해서 **독립된 새 트랜잭션을 안 만든다.**
+
+결과적으로 `User.status = WITHDRAWN`은 `WithdrawService.execute()` 전체가 끝나야 커밋된다.
+
+처음에 막으려던 레이스 컨디션이 코드 리뷰 없이는 눈에 안 띄는 형태로 그대로 살아있었던 셈이다
+- `MarkUserWithdrawService`를 별도 서비스로 분리한 것 자체는 맞는 방향이었는데, 그걸 부르는 쪽에 나중에 `@Transactional`이 하나 더 붙으면서 의미가 사라졌다.
+
+---
+
+## 3. 왜 `WithdrawService.execute()`를 트랜잭션 없이 두면 안 되나
+
+가장 간단한 수정은 `WithdrawService.execute()`에서 `@Transactional`을 빼는 것처럼 보인다.
+
+그런데 이건 두 가지 이유로 임시방편에 가깝다.
+
+- 마지막 줄 `userRepository.delete(user)`는 트랜잭션이 있어야 실제로 실행/flush된다.
+- 더 근본적으로, `WithdrawService.execute()`가 트랜잭션 없이 유지되는 걸 "우연히 그렇다"에 기대는 설계는 깨지기 쉽다.
+
+**최종 선택**
+
+**호출되는 쪽(`MarkUserWithdrawService`)이 자신을 누가 어떤 트랜잭션 컨텍스트에서 부르든 상관없이 항상 독립적으로 커밋되도록 강제**하는 것
+- `Propagation.REQUIRES_NEW`.
+
+```kotlin
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+override fun execute(userId: UserId): Pair<User, Instant> { ... }
+```
+
+> `REQUIRES_NEW`는 현재 활성 트랜잭션이 있어도 그걸 일시 정지시키고 완전히 새로운 트랜잭션을 열어서 독립적으로 커밋한다.
+>
+> 이렇게 하면 `WithdrawService.execute()`가 `@Transactional`이든 아니든, 앞으로 그 안에 어떤 코드가 추가되든 `MarkUserWithdrawService`의 독립성은 항상 보장된다
+
+### "일시 정지"
+
+`AbstractPlatformTransactionManager.handleExistingTransaction()`([source](https://github.com/spring-projects/spring-framework/blob/694224f1a6aac97d3f76848ee7ff2a3c4129c852/spring-tx/src/main/java/org/springframework/transaction/support/AbstractPlatformTransactionManager.java#L445))가 이미 진행 중인 트랜잭션 위에서 새 트랜잭션 요청이 들어왔을 때 전파 옵션별로 분기하는 지점이다.
+
+`REQUIRES_NEW`는 이렇게 처리된다.
+
+```java
+if (definition.getPropagationBehavior() == TransactionDefinition.PROPAGATION_REQUIRES_NEW) {
+    if (debugEnabled) {
+        logger.debug("Suspending current transaction, creating new transaction with name [" +
+                definition.getName() + "]");
+    }
+    SuspendedResourcesHolder suspendedResources = suspend(transaction);
+    try {
+        return startTransaction(definition, transaction, false, debugEnabled, suspendedResources);
+    }
+    catch (RuntimeException | Error beginEx) {
+        resumeAfterBeginException(transaction, suspendedResources, beginEx);
+        throw beginEx;
+    }
+}
+```
+
+`suspend(transaction)`이 현재 트랜잭션의 리소스(커넥션, 동기화 콜백 목록 등)를 떼어내서 보관해두고, 그 자리에 `startTransaction()`으로 완전히 새 트랜잭션을 만든다.
+
+이 새 트랜잭션이 끝나야(커밋/롤백) 원래 트랜잭션이 재개된다
+- `MarkUserWithdrawService`의 커밋이 `WithdrawService`가 나중에 뭘 하든과 완전히 분리되는 이유가 정확히 이 지점에 있다.
+- 같은 파일의 기본값(`PROPAGATION_REQUIRED`) 분기에는 이런 `suspend()` 호출이 없다.
+
+> 참고 - detached 엔티티로 넘어간 뒤 `delete()`가 되는 이유
+>
+> `REQUIRES_NEW`로 독립 커밋되고 나면, `MarkUserWithdrawService.execute()`가 반환하는 `savedUser`는 그 트랜잭션의 영속성 컨텍스트가 이미 닫혔으므로 **detached 상태**가 된다.
+>
+> `WithdrawService.execute()`가 이 detached 엔티티를 그대로 `userRepository.delete(user)`에 넘기는데, 이게 안전한지 확인이 필요했다.
+>
+> Spring Data JPA의 `SimpleJpaRepository.delete(entity)`는 넘어온 엔티티가 현재 영속성 컨텍스트에 없으면(`!em.contains(entity)`) 내부적으로 `em.merge(entity)`로 재부착한 뒤 삭제한다.
+>
+> 순수 JPA의 `EntityManager.remove()`는 detached 엔티티를 넘기면 `IllegalArgumentException`을 던지지만, Spring Data JPA 구현체는 이 케이스를 이미 처리해주고 있어서 별도 조회 없이 그대로 넘겨도 문제없다.

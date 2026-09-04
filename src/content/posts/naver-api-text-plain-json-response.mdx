@@ -1,0 +1,115 @@
+---
+author: 허진수
+pubDatetime: 2026-09-04T11:00:00.000Z
+title: "네이버 API -  JSON 데이터의 Content-Type: text/plain 응답"
+slug: naver-api-text-plain-json-response
+featured: false
+tags:
+  - spring
+  - webclient
+  - jackson
+  - bug
+description: 네이버 검색 API가 실제로는 JSON 바디를 주면서 응답 헤더엔 Content-Type을 text/plain으로 내려보내서, WebClient의 기본 Jackson 디코더가 역직렬화에 실패하던 문제와 해결 과정
+---
+
+## 개요
+
+네이버 지도 검색 API를 WebClient로 연동하고 나서, 정상적으로 JSON을 응답하는데도 `WebClient`가 역직렬화에 실패하는 문제가 있었다.
+
+원인은 API 자체의 비표준 동작이었다
+- **네이버가 실제로는 JSON 바디를 내려주면서, 응답 헤더의 `Content-Type`은 `text/plain`으로 보내고 있었다.**
+
+---
+
+## 1. 이유 — `Content-Type`
+
+`WebClient`(정확히는 내부의 `ExchangeStrategies`)는 응답 바디를 어떤 디코더로 파싱할지 **MIME 타입 헤더를 기준으로** 결정한다.
+
+> 기본으로 등록된 Jackson JSON 디코더는 `Content-Type: application/json`(또는 `application/*+json`) 응답에만 반응하도록 되어 있다. 
+>
+> 네이버 응답은 바디가 진짜 JSON이어도 헤더가 `text/plain`이라, 이 기본 디코더가 아예 매칭이 안 되고 역직렬화를 시도조차 안 한다.
+
+---
+
+## 2. 해결
+`JacksonJsonDecoder`가 `text/plain`도 받아들이게 재등록
+
+```kotlin
+@Bean
+fun naverMapWebClient(): WebClient {
+    ...
+    return WebClient.builder()
+        .clientConnector(ReactorClientHttpConnector(httpClient))
+        .baseUrl(naverMapProperties.baseUrl)
+        .defaultHeader("X-NCP-APIGW-API-KEY-ID", naverMapProperties.clientId)
+        .defaultHeader("X-NCP-APIGW-API-KEY", naverMapProperties.clientSecret)
+        .defaultHeader("Content-Type", "application/json")
+        .codecs { configurer ->
+            val decoder = JacksonJsonDecoder(
+                JsonMapper.builder().build(),
+                MimeType("application", "json"),
+                MimeType("application", "*+json"),
+                MimeType("text", "plain")   // ← 네이버가 실제로 내려주는 Content-Type
+            )
+            configurer.customCodecs().register(decoder)
+        }
+        .build()
+}
+```
+
+`JacksonJsonDecoder`를 생성할 때 이 디코더가 반응할 MIME 타입 목록을 직접 지정할 수 있다.
+
+기본 목록(`application/json`, `application/*+json`)에 `text/plain`을 추가해서, 이 WebClient 인스턴스에 한해서만 "본문이 JSON이면 `Content-Type`이 `text/plain`이어도 JSON으로 파싱해라"는 예외를 만들었다.
+
+> 이 커스터마이징을 **이 WebClient Bean 안에서만** 했다는 게 중요하다.
+>
+> `text/plain`을 JSON으로 취급하는 건 명백히 표준을 벗어난 처리라, 앱 전역 Jackson 디코더 설정에 넣으면 다른 곳(진짜 순수 텍스트 응답을 주는 API)에서 의도치 않게 JSON 파싱을 시도하다 실패하는 사이드이펙트가 생길 수 있다.
+>
+> 네이버 전용 `WebClient` Bean 하나에만 격리해서, "네이버가 이상하게 군다"는 사실을 그 Bean 밖으로 새어나가지 않게 했다.
+
+---
+
+## 3. 디버깅 로그 정리
+
+같은 커밋에서 원인을 찾는 동안 넣었던 임시 로그와 `try-catch`도 정리했다.
+
+```kotlin
+// 정리 전 — 원인 파악용으로 넣었던 로그/try-catch
+suspend fun mapSearch(...): NaverMapSearchResponse {
+    log.warn { "naver map api 진입 queryRequest=$queryRequest" }
+    return try {
+        val result = naverMapWebClient.get()
+            .uri { ... }
+            .retrieve()
+            .onStatus(HttpStatusCode::isError) { response ->
+                response.bodyToMono(String::class.java).map { body ->
+                    log.warn { "api error: [${response.statusCode().value()}] $body" }
+                    throw ExternalException(response.statusCode().value(), body)
+                }
+            }
+            .awaitBody<NaverMapSearchResponse>()
+        log.warn { "성공: ${result}" }
+        result
+    } catch (e: Exception) {
+        log.warn { "error ${e::class.simpleName} - ${e.message}" }
+        throw e
+    }
+}
+
+// 정리 후 — 원인(Content-Type)이 밝혀졌으니 임시 로그/try-catch 제거
+suspend fun mapSearch(...): NaverMapSearchResponse =
+    naverMapWebClient.get()
+        .uri { ... }
+        .retrieve()
+        .onStatus(HttpStatusCode::isError) { response ->
+            response.bodyToMono(String::class.java).map { body ->
+                throw ExternalException(response.statusCode().value(), body)
+            }
+        }
+        .awaitBody<NaverMapSearchResponse>()
+```
+
+> 원인을 못 찾은 동안엔 요청/응답 전체를 로그로 찍고 예외를 다시 던지기 전에 한 번 더 잡아보는 방어적인 코드가 쌓이기 마련인데, 진짜 원인(헤더 하나)이 밝혀지고 나면 그 방어 코드들은 더 이상 정보를 주지 못하는 잡음이 된다.
+>
+> 원인 규명이 끝난 시점에 이런 임시 코드를 걷어내는 것도 수정의 일부로 보는 게 맞다
+>  - 테스트 코드가 그 자리를 대신한다.

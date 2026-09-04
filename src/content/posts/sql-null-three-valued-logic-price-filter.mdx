@@ -1,0 +1,76 @@
+---
+author: 허진수
+pubDatetime: 2026-09-04T09:00:00.000Z
+title: "DB 3 value logic - 가격 협의 게시글이 필터에서 사라지던 이유"
+slug: sql-null-three-valued-logic-price-filter
+featured: false
+tags:
+  - sql
+  - querydsl
+  - jpa
+  - bug
+description: 가격 범위 필터를 걸면 가격을 정하지 않은(협의) 게시글이 항상 결과에서 빠지던 버그 — SQL의 3값 논리(NULL 비교는 항상 거짓)가 원인이었고, 수정하면서 두 가지 경계 조건을 의도적으로 다르게 처리했다
+---
+
+## 개요
+
+도움 요청 게시글 목록에 가격 범위 필터(`minPrice`/`maxPrice`)를 걸었을 때, **가격을 아직 정하지 않은("협의") 게시글이 필터 조건과 무관하게 항상 결과에서 빠지는** 버그가 있었다.
+
+필터를 걸든 안 걸든 협의 게시글이 안 보이는 게 아니라, "가격 필터를 하나라도 걸면" 사라지는 조건부 버그라 처음엔 원인을 짚기 까다로웠다.
+
+---
+
+## 1. 원인 — SQL은 `NULL >= x`를 참으로도 거짓으로도 안 본다
+
+원래 코드는 이랬다.
+
+```kotlin
+criteria.minPrice?.let { helpJpaEntity.priceOffer.price.goe(it) },
+criteria.maxPrice?.let { helpJpaEntity.priceOffer.price.loe(it) },
+```
+
+`minPrice`가 지정되면 `price >= minPrice` 조건이 붙는다.
+
+문제는 `price` 컬럼 자체가 "협의"인 게시글은 `NULL`이라는 것
+- SQL에서 `NULL >= 10000`은 `TRUE`도 `FALSE`도 아니라 `UNKNOWN`으로 평가되고, `WHERE` 절은 `UNKNOWN`을 `FALSE`와 동일하게 취급해 그 row를 걸러낸다.
+- 이게 SQL의 **3값 논리(three-valued logic)** - `TRUE`/`FALSE`/`UNKNOWN` 세 가지 값을 다루는 것이다.
+- `NULL`이 낀 비교 연산은 프로그래밍 언어의 직관(`null`과 비교하면 그냥 `false`가 나올 거라는 생각)과 다르게 동작한다.
+
+---
+
+## 2. 수정 — 근데 단순히 "OR isNull"만 붙이면 안 됐다
+
+가장 먼저 떠오르는 수정은 모든 가격 비교에 `.or(price.isNull())`을 붙이는 것이다.
+
+그런데 이렇게 하면 `minPrice`와 `maxPrice`를 **둘 다** 지정한 경우에도 협의 게시글이 계속 섞여 나온다
+
+"1만원에서 3만원 사이"로 명시적으로 좁힌 사용자 입장에서는 원하는 결과가 아니다.
+
+그래서 실제 수정은 조건 조합에 따라 분기했다.
+
+```kotlin
+when {
+    criteria.minPrice != null && criteria.maxPrice != null ->
+        helpJpaEntity.priceOffer.price.goe(criteria.minPrice)
+            .and(helpJpaEntity.priceOffer.price.loe(criteria.maxPrice))
+
+    criteria.maxPrice != null ->
+        helpJpaEntity.priceOffer.price.loe(criteria.maxPrice)
+            .or(helpJpaEntity.priceOffer.price.isNull)
+
+    criteria.minPrice != null ->
+        helpJpaEntity.priceOffer.price.goe(criteria.minPrice)
+            .or(helpJpaEntity.priceOffer.price.isNull)
+
+    else -> null
+}
+```
+
+- **한쪽 경계만 지정** (`minPrice`만, 또는 `maxPrice`만): 협의 게시글을 결과에 포함시킨다(`.or(isNull)`).
+  - "최소 1만원 이상"이라고 걸었을 때 "얼마인지 아직 안 정했지만 관심 있을 수 있는" 게시글까지 같이 보여주는 게 사용자 의도에 더 맞는다고 판단했다.
+- **양쪽 경계를 다 지정**: 협의 게시글을 의도적으로 제외한다.
+  - 범위를 명시적으로 좁힌 경우엔 "이 범위 안의 확정 가격"만 보고 싶어한다고 봤다.
+
+> 이건 버그를 고치는 것과 별개로, **"NULL을 결과에 포함시킬지"가 SQL 문법 문제가 아니라 비즈니스 판단 문제**라는 걸 보여주는 지점이다.
+>
+> 3값 논리 자체를 이해하는 것과, 그걸 도메인 요구사항에 맞게 어떻게 다룰지 결정하는 건 다른 층위의 문제다.

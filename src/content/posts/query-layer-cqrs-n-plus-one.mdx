@@ -1,0 +1,136 @@
+---
+author: 허진수
+pubDatetime: 2026-09-04T04:00:00.000Z
+title: 쿼리 - 효율적인 처리 와 N+1
+slug: query-layer-cqrs-n-plus-one
+featured: false
+tags:
+  - spring
+  - jpa
+  - querydsl
+  - ddd
+  - performance
+description: 조회 전용 서비스가 domain repository를 건너뛰어도 되는 이유, 그리고 @BatchSize 대신 QueryDSL Projection으로 N+1을 해결한 이유
+---
+
+## 개요
+프로젝트의 조회 관련해서 해결해야할 두가지 문제가 있다.
+- N+1 문제를 어떻게 해결 할 것 인가
+- DDD 레이어를 따라 조회를 구현할 경우 생기는 문제를 어떻게 해결 할 것인가
+  - JpaEntity에만 있는 데이터(creastedAt 등등)
+  - 너무 많은 레이어와 파일
+
+> 이에 대한 해답으로 CQRS 패턴을 참고하였다.
+
+---
+
+## 1. light-CQRS
+
+기본 원칙은 `presentation → app → domain ← infra` 방향의 DDD 레이어링이다.
+- app 서비스는 domain repository 인터페이스에만 의존하고, domain은 infra를 모른다.
+
+```kotlin
+// Command 서비스 — 정상 레이어링 (domain repository만 의존)
+@Service
+class BlockUserService(
+    private val blockRepository: BlockRepository,   // domain 인터페이스
+    private val domainEventPublisher: DomainEventPublisher,
+) : BlockUserUseCase { ... }
+```
+
+그런데 `UserQueryService`, `TermQueryService`, `ReviewQueryService`, `HelpQueryService` 같은 조회 전용 서비스들은 이 원칙에서 의도적으로 벗어난다.
+
+```kotlin
+// Query 서비스 — 예외 (infra를 직접 의존)
+@Service
+class UserQueryService(
+    private val userQuerydslRepository: UserQuerydslRepository  // infra 구현체
+) {
+    @Transactional(readOnly = true)
+    fun findTestUser(testUserProviderIds: Set<String>): List<TestUserQueryResult> =
+        userQuerydslRepository.findTestUserByProviderId(testUserProviderIds)
+}
+```
+
+**왜 허용하는가**
+> 조회는 도메인 불변식을 변경하지 않는다.
+>
+> QueryDSL로 필요한 컬럼만 뽑아 바로 조회 결과 DTO를 만드는 게, domain repository → 도메인 엔티티 → 다시 DTO로 변환하는 것보다 레이어도 적고 오버페칭도 적다.
+>
+> CQRS(Command/Query Responsibility Segregation)를 가볍게 적용한 설계 선택이다.
+
+**진짜 위반은**
+> 상태를 변경하는 Command 서비스가 infra를 직접 참조하거나, domain repository가 아닌 JPA repository를 직접 주입받는 경우다.
+>
+> 판단 기준은 "이 서비스가 저장/수정/삭제를 하는가"다.
+>
+> 코드 리뷰에서 새 `XxxQueryService`를 볼 때 확인할 것도 하나뿐이다
+> - `@Transactional(readOnly = true)`가 아닌 쓰기 메서드가 몰래 끼어 있으면 그 메서드만이라도 domain repository를 거치도록 분리해야 한다.
+
+---
+
+## 2. N+1 — `@BatchSize` 대신 QueryDSL
+
+N+1이 발생하는 지점은 Hibernate의 `@BatchSize` 같은 최적화 힌트에 기대지 않고, **QueryDSL로 필요한 형태를 직접 조회ㅐ**하도록 하였다.
+
+대표 사례가 `BlockedUserProfileAdapter`다.
+- 원래는 `findAllById`로 `UserJpaEntity` 전체를 읽어왔는데, 실제로 필요한 건 `nickname`, `profileImageKey` 두 컬럼뿐이었다.
+
+```kotlin
+// Before — 전체 엔티티 조회, N+1 위험 + 오버페칭
+userJpaRepository.findAllById(userIds)
+
+// After — 필요한 컬럼만 Projection
+queryFactory
+    .select(Projections.constructor(
+        BlockedUserProfile::class.java,
+        userJpaEntity.id, userJpaEntity.userProfile.nickName, userJpaEntity.userProfile.profileImageKey
+    ))
+    .from(userJpaEntity)
+    .where(userJpaEntity.id.`in`(userIds))
+    .fetch()
+```
+
+> `@BatchSize`를 쓰면 N+1은 줄어들지만 여전히 엔티티 전체를 끌고 오고, 배치 크기 튜닝이라는 또 다른 변수가 생긴다.
+>
+> Projection으로 직접 조회하면 필요한 컬럼만 SQL 레벨에서 뽑아오니 오버페칭도 없고, "N+1이 왜 안 나는지"가 힌트 설정이 아니라 쿼리 자체에서 명시적으로 드러난다.
+
+QueryDSL이 만능은 아니다. 쿼리가 복잡해질 경우 query 코드 자체가 너무 길어져 가독성이 떨어질 수 있다. 그 경우 에는 raw sql을 사용하는 것을 고려해야한다.
+
+---
+
+## 3. 번외 - 정렬 기준이 여러 개인 커서 페이지네이션
+
+List API는 offset이 아니라 커서 기반으로 구현하는데, 정렬 기준이 여러 개일 수 있는 경우(최신순/오래된순/가격순/거리순 등)는 정렬마다 "이 커서 이후" 조건을 만드는 헬퍼를 따로 둔다.
+
+```kotlin
+// HelpCursorConditions — HelpSort별로 afterXxxCursor() 함수 분리
+fun afterCursor(sort: HelpSort, cursor: Help?): BooleanExpression =
+    when (sort) {
+        HelpSort.LATEST -> afterLatestCursor(cursor)
+        HelpSort.PRICE -> afterPriceCursor(cursor)
+        HelpSort.DISTANCE -> afterDistanceCursor(cursor)
+    }
+```
+
+이 커서 조건 빌더 자체(2단/3단 튜플 비교, haversine 거리 계산 등)는 모듈마다 미묘하게 다른 로직이라 공통화하지 않았다
+- 억지로 하나의 제네릭 빌더로 묶으면 복잡도 대비 이득이 적고, 이미 잘 동작하는 코드에 버그를 심을 위험이 크다고 판단했다.
+
+반면 **"size+1로 조회한 결과에서 hasNext/nextCursor를 계산하는" 부분은 공통화했다**
+- 이건 정렬 로직과 무관하게 항상 같은 패턴이라 `common-infra`의 `CursorPage<T, ID>`로 뽑았다.
+
+```kotlin
+data class CursorPage<T, ID>(
+    val items: List<T>,
+    val nextCursor: ID?,
+    val hasNext: Boolean
+) {
+    companion object {
+        fun <T, ID> of(rows: List<T>, size: Int, idOf: (T) -> ID): CursorPage<T, ID>
+    }
+}
+```
+
+> "뭘 공통화하고 뭘 안 하는가"의 기준은 결국 하나였다
+> - **여러 곳에서 진짜로 동일한 로직인가, 아니면 표면적으로만 비슷해 보이는 서로 다른 로직인가.**
+> - 커서 조건 빌더는 후자였고, hasNext 계산은 전자였다.

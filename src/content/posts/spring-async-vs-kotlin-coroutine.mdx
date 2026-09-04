@@ -1,0 +1,202 @@
+---
+author: 허진수
+pubDatetime: 2026-09-04T00:00:00.000Z
+title: Spring @Async vs Kotlin 코루틴 — 회원탈퇴 소셜 unlink 처리로 보는 선택 기준
+slug: spring-async-vs-kotlin-coroutine
+featured: false
+tags:
+  - spring
+  - kotlin
+  - coroutine
+  - async
+  - concurrency
+description: 회원탈퇴 시 카카오/애플 unlink API 호출을 비동기로 처리하면서 정리한 @Async와 코루틴의 차이, 그리고 기존 아키텍처(블로킹 위주)에서 어떤 기준으로 골랐는지
+---
+
+## 개요
+
+회원탈퇴를 처리할 때 카카오/애플의 unlink(연결 끊기) API를 호출해야 했다.
+- 참고: [JWT 발급 및 세션 관리](/posts/jwt-session-management) 글 참고.
+- 문제는 이 호출이 응답 시간을 좌우하면 안 된다는 것
+- 카카오/애플 API가 느리거나 잠깐 죽어있어도 탈퇴 요청 자체는 정상적으로 끝나야 한다.
+
+후보는 두 가지였다.
+
+- Spring `@Async` — 스레드풀에 던지고 호출자는 기다리지 않는 전통적인 방식
+- Kotlin 코루틴(`suspend`) — 이미 `NaverMapController`가 `WebClient` + `suspend fun`으로 쓰고 있던 방식
+
+> 둘 다 "호출자를 안 기다리게 한다"는 목적은 같지만 메커니즘이 완전히 다르다
+>
+> 결과적으로 기존 아키텍처(JPA/Redis 블로킹 호출이 대부분이고, `WebClient`는 외부 API 어댑터 내부에서만 쓰는 구조)에 뭘 끼워 넣어야 하는지에 따라 답이 갈렸다.
+
+```
+WithdrawService.execute()
+  ├─ MarkUserWithdrawUseCase.execute()   ← 상태 전이, 독립 트랜잭션(REQUIRES_NEW)
+  ├─ SessionManager.removeAllSessions()  ← 블로킹, Redis
+  ├─ SocialUnlinkRunnerPort.unlinkAsync() ← 이번 글의 주제
+  └─ UserRepository.delete()             ← 블로킹, JPA
+```
+
+---
+
+## 1. `@Async` / `@EnableAsync` 동작 원리
+
+`@Async`는 그 자체로는 아무 일도 하지 않는다.
+
+`@EnableAsync`가 있어야 Spring이 `@Async`가 붙은 메서드를 가진 Bean에 AOP 프록시를 씌운다
+- `@Transactional`, `@Cacheable`과 완전히 같은 메커니즘이다.
+
+```kotlin
+@Configuration
+@EnableAsync
+class AsyncConfig
+```
+
+프록시를 통해(= 다른 Bean에서) `@Async` 메서드가 호출되면, 호출한 스레드에서 실행하는 대신 `TaskExecutor`에 작업을 던지고 즉시 리턴한다.
+
+반환 타입이 `void`/`Unit`이면 결과를 아예 안 기다리는 fire-and-forget이 되고, `Future`/`CompletableFuture`를 반환하도록 선언하면 그 핸들을 돌려받을 수 있다.
+
+---
+
+## 2. 기본 Executor — 순수 Spring과 Spring Boot는 다르다
+
+`@Async`용 `Executor` Bean을 따로 등록하지 않았을 때 뭐가 기본값으로 잡히는지가 순수 Spring Framework와 Spring Boot에서 다르다.
+- 이 fallback은 순수 Spring Framework의 `AsyncExecutionAspectSupport.getDefaultExecutor(BeanFactory)`([source](https://github.com/spring-projects/spring-framework/blob/16edf9867a143f95cefadb7b2115dcbbf624e176/spring-aop/src/main/java/org/springframework/aop/interceptor/AsyncExecutionAspectSupport.java#L232))에 그대로 나와 있다.
+
+```java
+protected @Nullable Executor getDefaultExecutor(@Nullable BeanFactory beanFactory) {
+    if (beanFactory != null) {
+        try {
+            // Search for TaskExecutor bean... not plain Executor since that would
+            // match with ScheduledExecutorService as well, which is unusable for
+            // our purposes here. TaskExecutor is more clearly designed for it.
+            return beanFactory.getBean(TaskExecutor.class);
+        }
+        catch (NoUniqueBeanDefinitionException ex) {
+            // 이름이 "taskExecutor"인 Executor Bean을 찾아본다
+            ...
+        }
+        catch (NoSuchBeanDefinitionException ex) {
+            // 여기까지 못 찾으면 최종적으로 SimpleAsyncTaskExecutor로 폴백
+        }
+    }
+    ...
+}
+```
+
+> 컨텍스트에서 `TaskExecutor` 타입 Bean(또는 이름이 `taskExecutor`인 `Executor` Bean)을 찾고, 그마저 없을 때만 `SimpleAsyncTaskExecutor`로 떨어진다.
+>
+> Spring Boot의 `TaskExecutionAutoConfiguration`이 `applicationTaskExecutor`라는 이름으로 `ThreadPoolTaskExecutor`를 미리 등록해두기 때문에, Boot 프로젝트에서는 이 조회가 대부분 성공해서 풀링된 Executor를 쓰게 되는 것이다.
+
+| 환경 | 기본 Executor | 특징 |
+|---|---|---|
+| 순수 Spring (Boot 없이) | `SimpleAsyncTaskExecutor` | **스레드를 재사용하지 않음** — 호출마다 새 스레드 생성 |
+| Spring Boot | `ThreadPoolTaskExecutor` (`applicationTaskExecutor`) | 진짜 풀링, `spring.task.execution.*`로 설정 가능 |
+
+`SimpleAsyncTaskExecutor`는 이름 그대로 "Simple"해서 스레드 풀링을 안 한다
+- 매 호출마다 새 스레드를 만들고 버린다.
+
+`TaskExecutionAutoConfiguration`에서는 자동으로 진짜 스레드풀을 등록해준다.
+
+> 한 가지 예외: Java 21+ 가상 스레드(`spring.threads.virtual.enabled=true`)를 켜면 Boot도 다시 `SimpleAsyncTaskExecutor`(가상 스레드 기반)를 쓴다.
+>
+> 가상 스레드는 생성 비용이 사실상 무시할 수준이라 이 경우엔 풀링이 없어도 문제가 안 된다.
+
+
+### 이 프로젝트에는 실제로 뭐가 있나
+
+`iam` 모듈의 `AsyncConfig`는 딱 이만큼이다.
+
+```kotlin
+// iam/infra/configuration/AsyncConfig.kt
+@Configuration
+@EnableAsync
+class AsyncConfig
+```
+
+`Executor` Bean을 직접 등록하지도, `spring.task.execution.*`(풀 크기, 큐 용량 등)을 `application.yml`에 튜닝해두지도 않았다
+- `@EnableAsync`만 켜고 나머지는 전부 Boot 기본값에 맡긴 상태다. 즉 지금 `SocialUnlinkRunnerAdapter.unlinkAsync()`가 실제로 올라타는 스레드풀은 위에서 본 `getDefaultExecutor()`가 찾아낸 `applicationTaskExecutor`, 그대로다.
+- unlink 호출 빈도(유저 탈퇴 시 1회)를 생각하면 기본값으로 충분하지만, 나중에 이 패턴을 트래픽이 더 많은 곳에 재사용한다면 그때는 `spring.task.execution.pool.*`을 명시적으로 잡아주는 게 맞다.
+
+---
+
+## 3. 자기호출(self-invocation) 문제
+
+`@Transactional`과 동일한 함정이 그대로 있다. 같은 클래스 안에서 `this.xxx()`로 `@Async` 메서드를 호출하면 프록시를 안 거쳐서 그냥 동기 실행된다.
+
+- `WithdrawService` 안에 `@Async` 메서드를 만들어서 자기 자신을 호출하면 안 되고, **별도 Bean**으로 빼야 한다.
+- 이 Bean은 app 레이어가 아니라 infra 개념(외부 API 호출을 비동기로 감싸는 것)이라, `WithdrawService`(app)가 직접 이 구현체를 알면 레이어 위반이 된다.
+- 그래서 인터페이스를 하나 뒀다.
+
+```kotlin
+// app/port/SocialUnlinkRunnerPort.kt
+interface SocialUnlinkRunnerPort {
+    fun unlinkAsync(provider: OAuthProvider, providerId: String)
+}
+```
+
+```kotlin
+// infra/external/SocialUnlinkRunnerAdapter.kt
+@Component
+class SocialUnlinkRunnerAdapter(
+    private val resolver: SocialUnlinkResolver,
+) : SocialUnlinkRunnerPort {
+
+    private val log = KotlinLogging.logger {}
+
+    @Async
+    override fun unlinkAsync(provider: OAuthProvider, providerId: String) {
+        runCatching {
+            resolver[provider].unlink(providerId)
+        }.onFailure {
+            log.error(it) { "Failed to unlink social account, provider=$provider, providerId=$providerId" }
+        }
+    }
+}
+```
+
+> `runCatching`을 여기서 감싸는 이유도 자기호출 문제와 무관하지 않다
+> - `@Async` void 메서드에서 던진 예외는 기본적으로 호출자에게 전파되지 않고 별도 핸들러로 흘러가는데, 그 흐름에 기대기보다는 명시적으로 잡아서 로깅하는 편이 추적하기 쉽다.
+
+---
+
+## 4. 그럼 코루틴은 왜 안 썼나
+
+이미 `NaverMapController.mapSearch()`가 `suspend fun` + `WebClient.awaitBody<T>()`로 완전히 코루틴을 사용하여 논 블로킹 처리를 하고 있다.
+
+다만 위에서 사용하지 않은 이유는 아래와 같다.
+- **`@Async`와 코루틴은 애초에 다른 문제를 푸는 도구**이기 때문이다.
+
+| | `@Async` (스레드풀) | 코루틴(`suspend`) |
+|---|---|---|
+| 실행 단위 | 실제 OS 스레드 | 경량 실행 단위, 스레드와 1:1 아님 |
+| 대기 중 자원 점유 | 스레드를 통째로 점유 | 스레드를 놓아주고 다른 코루틴이 씀 |
+| 강점 | 기존 블로킹 코드를 그대로 감싸서 별도 스레드로 던지기만 하면 됨 | 진짜 논블로킹 I/O(HTTP 응답 대기 등)에서 매우 적은 스레드로 대량 동시성 |
+
+`WithdrawService.execute()`가 부르는 나머지 작업들(`MarkUserWithdrawUseCase`의 JPA, `SessionManager`의 Redis, 마지막 `UserRepository.delete`)은 전부 블로킹이다.
+
+만약 `unlink()` 호출부만 `suspend fun`으로 바꾸고 컨트롤러까지 `suspend`로 끌어올렸다면
+
+- 블로킹 JPA/Redis 호출은 `suspend`로 감싸도 저절로 논블로킹이 되지 않는다 - 코루틴이 지금 돌고 있는 스레드를 그대로 점유한다.
+- 실제로 논블로킹 효과를 보려면 결국 `withContext(Dispatchers.IO) { ... }`로 블로킹 구간을 명시적으로 감싸야 하는데, 이건 "블로킹 작업을 별도 스레드풀로 던진다"는 점에서 `@Async`가 하는 일과 본질적으로 같다.
+- 거기에 코루틴 디스패처 개념까지 새로 끌어들이는 셈이라, 얻는 이득 없이 복잡도만 늘어난다.
+- 실제료 논블로킹의 효과를 볼려면, JPA, Redis 클라이언트 등 전부 코루틴을 지원하는 리엑티브 스택으로 바꿔야한다. -> 이는 너무 큰 변경이다.
+
+> 즉 컨트롤러 하나만 `suspend`로 바꾼다고 되는 게 아니라, 그 밑에 걸린 블로킹 체인 전체를 디스패처 인지형으로 다시 짜야 코루틴의 이점을 실제로 볼 수 있다.
+>
+> 지금 필요한 건 "unlink 실패가 탈퇴 응답을 막지 않게 하는 것" 하나뿐이라, 이미 검증된 블로킹 스택 위에 `@Async` 하나만 얹는 쪽이 훨씬 적은 변경으로 같은 목적을 달성한다.
+
+반대로 `NaverMapController`가 코루틴을 쓰는 건 정확히 코루틴이 잘하는 상황이다
+- `WebClient` 호출 하나뿐이고 블로킹 코드가 섞여 있지 않으니, 논블로킹 I/O 대기의 이점을 그대로 누릴 수 있다.
+
+---
+
+## 요약
+
+| 항목 | 선택 | 이유 |
+|---|---|---|
+| 비동기 메커니즘 | `@Async` (스레드풀) | 호출 체인이 대부분 블로킹(JPA/Redis)이라, 코루틴으로 가려면 체인 전체를 디스패처 인지형으로 바꿔야 함 — 이득 대비 비용이 큼 |
+| Executor | Spring Boot 기본값(`applicationTaskExecutor`) | Boot가 이미 풀링된 `ThreadPoolTaskExecutor`를 자동 등록 — 순수 Spring의 `SimpleAsyncTaskExecutor`(비풀링)와 다름 |
+| 자기호출 회피 | 별도 Bean(`SocialUnlinkRunnerAdapter`)으로 분리 | `@Async`도 `@Transactional`과 동일하게 프록시 기반이라 같은 클래스 내부 호출로는 무효화됨 |
+| 레이어링 | `app/port/SocialUnlinkRunnerPort` + infra 구현체 | 비동기 실행이라는 infra 관심사를 app이 직접 알지 않도록 인터페이스로 격리 |
+| 예외 처리 | 어댑터 내부 `runCatching` | `@Async` void 메서드의 기본 예외 처리(핸들러로 전파)에 기대지 않고 명시적으로 로깅 |

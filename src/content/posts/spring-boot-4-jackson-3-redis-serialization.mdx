@@ -1,0 +1,97 @@
+---
+author: 허진수
+pubDatetime: 2026-09-04T08:00:00.000Z
+title: Spring Boot 4 + Jackson 3 — Redis 직렬화가 조용히 어긋나는 지점
+slug: spring-boot-4-jackson-3-redis-serialization
+featured: false
+tags:
+  - spring
+  - spring-boot
+  - jackson
+  - redis
+  - migration
+description: Spring Boot 4의 기본 ObjectMapper가 Jackson 3(tools.jackson)로 바뀌면서, Jackson 2 기반 GenericJackson2JsonRedisSerializer를 그대로 쓰면 안 되는 이유와 실제로 겪은 이슈
+---
+
+## 개요
+
+Spring Boot 4는 기본 `ObjectMapper`를 Jackson 3(`tools.jackson`) 기반 `JsonMapper`로 바꿨다.
+- 기존 `com.fasterxml.jackson`이 아니라 `tools.jackson`이다. 이 프로젝트에서 이게 실제로 Redis 캐시 직렬화 쪽에 영향을 줬다.
+
+ `JacksonAutoConfiguration`([source](https://github.com/spring-projects/spring-boot/blob/02b3242057988ffff3c57ab5461457a9092e5535/module/spring-boot-jackson/src/main/java/org/springframework/boot/jackson/autoconfigure/JacksonAutoConfiguration.java#L132-L135)) 참고
+
+```java
+import tools.jackson.databind.json.JsonMapper; // com.fasterxml.jackson이 아니다
+
+@Bean
+@Primary
+JsonMapper jacksonJsonMapper(JsonMapper.Builder builder) { ... }
+```
+
+`@Primary`가 붙은 기본 `ObjectMapper` 격인 Bean이 정확히 `tools.jackson.databind.json.JsonMapper` 타입이다. 커스텀 직렬화 설정을 넣으려면 이제 `JsonMapperBuilderCustomizer`(Jackson 3, 같은 패키지)를 구현해야 한다.
+
+---
+
+## 1. Redis 캐시 직렬화 — `GenericJackson2JsonRedisSerializer`는 이제 deprecated
+
+Spring Data Redis의 `GenericJackson2JsonRedisSerializer`(Jackson 2 기반)는 Boot 4부터 deprecated(`forRemoval`)다.
+- 대신 Jackson 3용 `GenericJacksonJsonRedisSerializer`를 써야 한다.
+
+```kotlin
+/**
+ * Spring Boot 4는 Jackson3(tools.jackson) 기반 JsonMapper를 기본 ObjectMapper로 쓴다
+ * (spring-boot-jackson의 JacksonAutoConfiguration#jacksonJsonMapper 참고). 그래서 캐시 값
+ * 직렬화도 Jackson3용 GenericJacksonJsonRedisSerializer를 사용한다 — Jackson2 기반
+ * GenericJackson2JsonRedisSerializer는 4.0부터 deprecated(forRemoval)이다.
+ */
+@Configuration
+@EnableCaching
+class CacheConfig {
+    companion object {
+        fun createValueSerializer(): GenericJacksonJsonRedisSerializer {
+            val typeValidator = BasicPolymorphicTypeValidator.builder()
+                .allowIfSubType("com.gachi.")
+                .allowIfSubType("java.util.")
+                .allowIfSubType("java.lang.")
+                .allowIfSubType("kotlin.")
+                .build()
+
+            return GenericJacksonJsonRedisSerializer.builder()
+                .enableDefaultTyping(typeValidator)
+                .build()
+        }
+    }
+}
+```
+
+`builder()`가 호출마다 독립된 `JsonMapper.Builder`를 새로 만들기 때문에, 앱 전역 `JsonMapper` 빈을 공유/변경하지 않고 캐시 전용 `ObjectMapper`를 격리해서 쓸 수 있다는 것도 이 방식의 장점이다.
+
+`enableDefaultTyping(typeValidator)`는 역직렬화 시 타입 정보를 값 안에 함께 저장해서(`@class` 메타데이터 형태) 다형성을 지원한다.
+- 이때 프로젝트 도메인 클래스만 화이트리스트에 허용해서(`com.gachi.*`) 임의 클래스 역직렬화로 인한 보안 문제를 막는다.
+
+이 시리얼라이저는 나중에 회원탈퇴 기능의 재가입 차단 마커(`WithdrawMarker`/`WithdrawPayload`)를 저장하는 `redisJsonTemplate`에도 그대로 재사용했다
+- 새로 만들지 않고 `CacheConfig.createValueSerializer()`를 사용했다.
+
+이 프로젝트의 `JacksonSerializationConfig`(`Instant` 커스텀 직렬화 모듈 추가용)도 실제로 확인해보니 `tools.jackson.*` 기준으로 정확히 `JsonMapperBuilderCustomizer`를 구현하고 있었다 — Jackson 2/3 이름이 비슷한 인터페이스가 섞여 있어서 자칫 헷갈리기 쉬운데, 다행히 이 프로젝트는 처음부터 맞게 되어 있었다.
+
+---
+
+## 2. Boolean 프로퍼티(`isXxx`) 직렬화 어긋남 주의
+
+Jackson 3의 실제 `ObjectMapper`가 `tools.jackson`이라는 걸 놓치면, `isXxx` 형태의 Boolean 프로퍼티에서 직렬화/역직렬화 시 필드명이 어긋날 수 있다.
+
+캐싱 대상 타입에 이런 프로퍼티가 있으면 실제 캐시 적중/직렬화 여부를 테스트로 반드시 확인해야 한다
+- 컴파일 타임에는 안 잡히고 런타임에 캐시 미스나 역직렬화 실패로만 드러나는 종류의 문제라서, 눈치채기 어렵다.
+
+---
+
+## 요약
+
+| 항목 | Boot 4 이전 | Boot 4 이후 |
+|---|---|---|
+| 기본 `ObjectMapper` | Jackson 2 (`com.fasterxml.jackson`) | Jackson 3 (`tools.jackson`) |
+| Redis 캐시 직렬화 | `GenericJackson2JsonRedisSerializer` | `GenericJacksonJsonRedisSerializer` (Jackson2 버전은 deprecated) |
+| Boolean 프로퍼티(`isXxx`) | - | 직렬화 필드명이 어긋날 수 있어 캐싱 대상이면 실제 테스트 필요 |
+
+Jackson 2 → 3 전환은 컴파일 에러로 안 잡히는 게 제일 위험하다
+- 두 버전 다 API 모양이 비슷해서, "설정이 실제로 적용되고 있는지"를 직접 실행해서 확인하지 않으면 마이그레이션이 절반만 된 채로 넘어가기 쉽다.
