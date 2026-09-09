@@ -10,18 +10,34 @@ export const GET: APIRoute = async context => {
   const regularFontPath = getFontPathByWeight(fonts, 400);
   const boldFontPath = getFontPathByWeight(fonts, 700);
 
-  if (regularFontPath === undefined || boldFontPath === undefined) {
+  const koreanFonts = fontData["--font-noto-sans-kr"];
+  const koreanRegularFontPath = getFontPathByWeight(koreanFonts, 400);
+  const koreanBoldFontPath = getFontPathByWeight(koreanFonts, 700);
+
+  if (
+    regularFontPath === undefined ||
+    boldFontPath === undefined ||
+    koreanRegularFontPath === undefined ||
+    koreanBoldFontPath === undefined
+  ) {
     throw new Error("Cannot find the font path.");
   }
 
-  const [regularData, boldData] = await Promise.all([
-    fetch(experimental_getFontFileURL(regularFontPath, context.url)).then(res =>
-      res.arrayBuffer()
-    ),
-    fetch(experimental_getFontFileURL(boldFontPath, context.url)).then(res =>
-      res.arrayBuffer()
-    ),
-  ]);
+  const [regularData, boldData, koreanRegularData, koreanBoldData] =
+    await Promise.all([
+      fetch(experimental_getFontFileURL(regularFontPath, context.url)).then(
+        res => res.arrayBuffer()
+      ),
+      fetch(experimental_getFontFileURL(boldFontPath, context.url)).then(
+        res => res.arrayBuffer()
+      ),
+      fetch(
+        experimental_getFontFileURL(koreanRegularFontPath, context.url)
+      ).then(res => res.arrayBuffer()),
+      fetch(
+        experimental_getFontFileURL(koreanBoldFontPath, context.url)
+      ).then(res => res.arrayBuffer()),
+    ]);
 
   const svg = await satori(
     {
@@ -34,7 +50,7 @@ export const GET: APIRoute = async context => {
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
-          fontFamily: "Google Sans Code",
+          fontFamily: "Google Sans Code, Noto Sans KR",
         },
         children: [
           {
@@ -153,6 +169,18 @@ export const GET: APIRoute = async context => {
         {
           name: "Google Sans Code",
           data: boldData,
+          weight: 700,
+          style: "normal",
+        },
+        {
+          name: "Noto Sans KR",
+          data: koreanRegularData,
+          weight: 400,
+          style: "normal",
+        },
+        {
+          name: "Noto Sans KR",
+          data: koreanBoldData,
           weight: 700,
           style: "normal",
         },
