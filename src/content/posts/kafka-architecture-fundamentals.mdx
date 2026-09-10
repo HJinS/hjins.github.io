@@ -1413,15 +1413,15 @@ Kafka는 단순한 메시지 큐가 아니다. **분산 커밋 로그** 아키�
 
 이 글은 다음 공식 문서, 기술 문서, 블로그를 기반으로 작성되었습니다:
 
-### Apache Kafka 공식 문서 & 사양
+### Apache Kafka 공식 자료
 
-| 출처 | 섹션 | 설명 |
-|------|------|------|
-| [Apache Kafka JavaDoc - KafkaProducer](https://kafka.apache.org/31/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html) | Producer 요청 흐름, 배치 처리 | Producer 아키텍처, 배치 메커니즘, RecordAccumulator, 버퍼 관리 |
-| [Apache Kafka - Message Format](https://kafka.apache.org/documentation/#messageformat) | Message Format v2 | RecordBatch 바이너리 구조, 필드 정의, 포맷 스펙 |
-| [A Guide To The Kafka Protocol](https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol) | Producer 요청 흐름 | ProduceRequest/Response 프로토콜, RequiredAcks 정책 |
-| [Idempotent Producer Design](https://cwiki.apache.org/confluence/display/KAFKA/Idempotent+Producer) | Producer 요청 흐름 - Idempotent | ProducerId, Sequence Number, 중복 제거 메커니즘 |
-| [Transactional Messaging in Kafka](https://cwiki.apache.org/confluence/display/KAFKA/Transactional+Messaging+in+Kafka) | Producer 요청 흐름 | Transaction 설계, InitPhase/SendPhase/EndPhase 흐름 |
+| 출처 | 설명 |
+|------|------|
+| [Apache Kafka JavaDoc - KafkaProducer](https://kafka.apache.org/31/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html) | Producer 아키텍처, 배치 메커니즘, RecordAccumulator, 버퍼 관리 |
+| [A Guide To The Kafka Protocol - Message Format](https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-Messages) | Message Format v2, RecordBatch 바이너리 구조 |
+| [A Guide To The Kafka Protocol - Produce API](https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-Produce) | ProduceRequest/Response 프로토콜, RequiredAcks 정책 |
+| [Idempotent Producer Design](https://cwiki.apache.org/confluence/display/KAFKA/Idempotent+Producer) | ProducerId, Sequence Number, 중복 제거 메커니즘 |
+| [Transactional Messaging in Kafka](https://cwiki.apache.org/confluence/display/KAFKA/Transactional+Messaging+in+Kafka) | Transaction 설계, InitPhase/SendPhase/EndPhase 흐름 |
 
 ### 기술 블로그 & 참고 자료
 
