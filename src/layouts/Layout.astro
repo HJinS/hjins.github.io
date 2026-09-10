@@ -135,6 +135,8 @@ const rssHref = getRelativeLocaleUrl(
     <!-- Mermaid diagram support -->
     <script defer src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
     <script>
+      declare const mermaid: any;
+
       function initMermaid() {
         if (typeof mermaid !== "undefined") {
           mermaid.initialize({ startOnLoad: true, securityLevel: "loose" });

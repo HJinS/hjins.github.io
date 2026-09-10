@@ -8,7 +8,7 @@ export function remarkMermaid() {
 
       // Convert code block to HTML div
       const htmlNode = {
-        type: "html",
+        type: "html" as const,
         value: `<div class="mermaid">${node.value}</div>`,
       };
 
