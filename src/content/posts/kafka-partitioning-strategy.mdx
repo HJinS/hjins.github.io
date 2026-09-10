@@ -1,0 +1,692 @@
+---
+author: 허진수
+pubDatetime: 2026-09-09T00:00:00.000Z
+title: Kafka 파티셔닝 전략과 순서 보장
+slug: kafka-partitioning-strategy
+featured: false
+tags:
+  - kafka
+description: 파티션 키 설계부터 Consumer Rebalancing까지 — Kafka에서 순서를 보장하면서 확장하는 방법
+---
+
+## 개요
+
+**이 글에서는 Partition Key 설계가 어떻게 시스템 아키텍처를 결정하는가**를 다룬다.
+
+Kafka의 기본 구조와 아키텍처 (Broker, Replication, Producer/Consumer 프로토콜)는 **[kafka-architecture-fundamentals](/posts/kafka-architecture-fundamentals)** 에서 배운다.
+
+```
+Kafka 핵심 개념 3가지:
+
+1. Topic: 메시지의 카테고리
+2. Partition: Topic을 나누는 단위 (병렬성의 근원)
+3. Partition Key: 이벤트가 어느 파티션으로 갈지 결정하는 메커니즘
+```
+
+---
+
+## 1. Kafka 파티셔닝의 기본 메커니즘
+
+### Topic과 Partition 구조
+
+```
+Topic: "orders"
+│
+├─ Partition 0: [msg1] [msg3] [msg5] ... <- 순서 보장 (offset 0, 1, 2, ...)
+├─ Partition 1: [msg2] [msg4] [msg6] ... <- 순서 보장
+├─ Partition 2: [msg7] [msg8] [msg9] ... <- 순서 보장
+└─ Partition 3: [msg10][msg11][msg12]... <- 순서 보장
+
+각 파티션:
+- 독립된 로그 (append-only)
+- FIFO 순서 보장
+- 병렬 읽기/쓰기 가능
+```
+
+### Partition Key와 해싱
+
+Producer에서 메시지를 보낼 때:
+
+```java
+ProducerRecord<String, OrderEvent> record =
+    new ProducerRecord<>(
+        "orders",           // topic
+        "user_123",         // <- partition key
+        orderEvent          // value
+    );
+
+// Kafka 내부:
+partition_index = hash(partition_key) % num_partitions
+                = hash("user_123") % 4
+                = 2
+// -> Partition 2로 전송
+```
+
+**중요**: 같은 partition key를 가진 모든 메시지는 같은 파티션으로 간다.
+
+```
+user_123: Order 1 -> Partition 2
+user_123: Order 2 -> Partition 2 (같은 파티션)
+user_123: Order 3 -> Partition 2 (같은 파티션)
+
+user_456: Order 1 -> Partition 1 (다른 파티션)
+user_456: Order 2 -> Partition 1
+```
+
+---
+
+## 2. Partition Key 설계 원칙
+
+### 원칙 1: 순서가 중요한 데이터를 기준으로
+
+```
+❌ 나쁜 예: 랜덤 키
+msg1: partition_key = random()
+msg2: partition_key = random()
+-> 같은 파티션으로 갈 보장 없음
+-> 순서 보장 불가능
+
+✅ 좋은 예: 엔티티별 순서 필요
+msg1: partition_key = "user_123"  (사용자별로 순서 추적)
+msg2: partition_key = "user_123"  (같은 사용자 이벤트 순서 보장)
+```
+
+### 원칙 2: 파티션 부하 분산 고려
+
+```
+❌ 나쁜 예: 파티션 스큐(skew) 발생
+partition_key = country_code
+
+분포:
+- "US": 70% (인구 많음)
+- "KR": 5%
+- "JP": 3%
+- ...
+
+결과:
+Partition 0 (US): 100 msg/s (핫 파티션)
+Partition 1 (KR): 5 msg/s
+Partition 2 (JP): 3 msg/s
+
+Partition 0의 컨슈머만 과부하
+```
+
+```
+✅ 개선: 복합 키 (composite key)
+partition_key = country_code + "_" + user_id
+
+분포:
+- "US_user_1": 0.1 msg/s
+- "US_user_2": 0.1 msg/s
+- ...
+- "KR_user_1": 0.05 msg/s
+- ...
+
+모든 파티션이 균등하게 부하 분산
+```
+
+### 원칙 3: 동시성 제어 경계 설정
+
+```
+사례: 결제 시스템
+- 같은 사용자의 결제 이벤트는 순서대로 처리해야 함
+  (중복 결제 방지, 상태 추적)
+
+partition_key = user_id
+
+결과:
+- user_123의 모든 결제 -> Partition X
+- Consumer가 순차적으로 처리
+- 동시성 제어 불필요 (같은 파티션 = 같은 스레드)
+```
+
+---
+
+## 3. Partition 개수 결정
+
+### 처리량 기반 계산
+
+```
+필요 처리량: 100,000 메시지/초
+컨슈머당 처리량: 10,000 메시지/초
+필요 컨슈머 수: 100,000 / 10,000 = 10개
+
+파티션 수 ≥ 필요 컨슈머 수
+-> 최소 10개 파티션 필요
+
+권장: 여유를 두어 15-20개 파티션
+```
+
+### Rebalancing 영향도
+
+```
+파티션 수 = 12
+컨슈머 수 = 4
+
+초기 상태 (균등 할당):
+Consumer 1: Partition 0, 4, 8
+Consumer 2: Partition 1, 5, 9
+Consumer 3: Partition 2, 6, 10
+Consumer 4: Partition 3, 7, 11
+
+컨슈머 1이 죽으면 Rebalancing 발생:
+Consumer 2: Partition 1, 5, 9, 0, 4 <- 재할당 (짧은 stop)
+Consumer 3: Partition 2, 6, 10, ...
+Consumer 4: Partition 3, 7, 11, ...
+
+Rebalancing 시간: 컨슈머 수 × 파티션 당 처리 지연
+-> 파티션이 많을수록 rebalancing 오래 걸림
+```
+
+---
+
+## 4. Consumer Group과 Offset 관리
+
+### Consumer Group 개념
+
+**Consumer Group이란?**
+
+Kafka에서 같은 `group.id`를 가진 여러 Consumer를 하나의 **Consumer Group**으로 묶습니다. 
+Consumer Group의 핵심 목적은 **병렬 처리**입니다:
+
+```
+Single Consumer:
+  Topic "orders" <- 모든 파티션 처리 (병목)
+
+Consumer Group (3개 Consumer):
+  Partition 0 <- Consumer 1 (병렬)
+  Partition 1 <- Consumer 2 (병렬)
+  Partition 2 <- Consumer 3 (병렬)
+  
+결과: 처리량 3배 증가
+```
+
+### Group Coordinator와 동작 원리
+
+**Group Coordinator 역할:**
+
+```
+1. Consumer 등록
+   - Consumer가 join() -> Coordinator에 등록
+   - 동일 group.id의 모든 Consumer 추적
+
+2. Partition 할당
+   - Assignment Strategy 선택 (Range, RoundRobin, Sticky)
+   - 각 Consumer에게 파티션 할당
+
+3. Heartbeat 모니터링
+   - 주기적으로 Consumer의 생존 확인
+   - session.timeout.ms 내 heartbeat 없으면 제거
+   - -> Rebalancing 자동 트리거
+
+4. Offset 관리
+   - __consumer_offsets Topic에 각 Consumer의 offset 저장
+   - Consumer 재시작 시 마지막 offset에서 재개
+```
+
+### Heartbeat와 Session 관리
+
+Consumer의 생존 여부는 **두 가지 메커니즘**으로 추적됩니다:
+
+```properties
+# 1. Heartbeat (주기적 신호)
+heartbeat.interval.ms = 3000  # 기본값
+  <- Consumer가 3초마다 "나 살아있어"라고 신호
+  <- Coordinator가 신호 확인 -> Consumer 활성 판정
+
+session.timeout.ms = 10000  # 기본값
+  <- Heartbeat 없이 10초 경과 시 Consumer 제거
+  <- Rebalancing 자동 발생
+
+# 2. Poll 타임아웃 (응답성 확인)
+max.poll.interval.ms = 300000  # 기본값 (5분)
+  <- 5분 이상 poll() 호출 없으면 Consumer 자동 제거
+  <- 무한 루프/응답 없는 상황 감지
+```
+
+**Heartbeat vs Poll의 차이:**
+
+```
+Heartbeat:
+  - poll() 내부에서 자동 전송
+  - 1초 단위로 가능
+  - 무거운 처리 중에도 백그라운드에서 전송
+
+Poll:
+  - 애플리케이션이 직접 호출해야 함
+  - 처리가 오래 걸리면 poll() 안 됨
+  - max.poll.interval.ms 초과 -> 제거
+
+-> 따라서 poll()은 자주 호출해야 함 (무거운 작업은 비동기로 처리)
+```
+
+### Consumer Group 구조
+
+**같은 Topic을 여러 Consumer Group이 독립적으로 구독할 수 있습니다:**
+
+```
+Topic: "orders" (3개 파티션)
+│
+├─ Consumer Group A (group.id = "analytics")
+│  ├─ Consumer 1: Partition 0 (offset 100)
+│  ├─ Consumer 2: Partition 1 (offset 50)
+│  └─ Consumer 3: Partition 2 (offset 75)
+│     └─ 역할: 분석용 처리
+│
+└─ Consumer Group B (group.id = "billing")
+   └─ Consumer X: Partition 0,1,2 (offset 추적 독립)
+      └─ 역할: 결제용 처리
+```
+
+**핵심: 다중 Consumer Group (Multiple Subscriptions)**
+
+```
+같은 메시지를 여러 Consumer Group이 독립적으로 처리:
+
+시간 T:
+  Topic "orders"에 메시지 저장
+        ↓
+  [메시지 A] [메시지 B] [메시지 C]
+        ↓
+    ┌─────────────────────────┐
+    │ Group A (analytics)     │
+    │ offset: 0->1 처리 중...  │
+    └─────────────────────────┘
+        ↓
+    ┌─────────────────────────┐
+    │ Group B (billing)       │
+    │ offset: 0->1 처리 중...  │
+    └─────────────────────────┘
+
+결과:
+- Group A offset: 1 (offset 0 처리 완료)
+- Group B offset: 1 (offset 0 처리 완료)
+- 같은 메시지 A를 두 그룹이 모두 처리함
+- 각 그룹은 독립적인 offset 위치 보유
+
+이유:
+__consumer_offsets Topic에:
+  [group_id="analytics", partition=0] -> offset=100
+  [group_id="billing", partition=0] -> offset=50
+  
+같은 파티션이라도 group_id가 다르면 별도 offset 관리
+```
+
+### Offset 커밋 전략
+
+**1. Auto-commit (자동 커밋)**
+
+```java
+// 가장 간단하지만 위험
+props.put("enable.auto.commit", true);
+props.put("auto.commit.interval.ms", 5000);  // 5초마다 자동 커밋
+
+consumer.poll(Duration.ofMillis(100));
+// 메시지 처리 중에 크래시 발생
+// -> 메시지 손실 가능 (처리 전 커밋됨)
+```
+
+**2. Manual commit (수동 커밋) - 권장**
+
+```java
+props.put("enable.auto.commit", false);
+
+while (true) {
+    ConsumerRecords<String, String> records = 
+        consumer.poll(Duration.ofMillis(100));
+    
+    for (ConsumerRecord<String, String> record : records) {
+        // 메시지 처리
+        processMessage(record);
+    }
+    
+    // 처리 완료 후 커밋
+    consumer.commitSync();  // Blocking
+}
+```
+
+**3. At-least-once 처리 (권장)**
+
+```java
+// 컨슈머 크래시 -> 재시작
+// -> 커밋 안 된 메시지부터 다시 처리
+// -> 중복 처리 가능성 (idempotent 처리 필수)
+
+consumer.commitSync();  // 동기 커밋 (느리지만 안전)
+```
+
+**4. Exactly-once 처리 (복잡)**
+
+```java
+// Kafka Transaction API 사용
+producer.beginTransaction();
+
+// 메시지 소비 + 처리 + 저장을 원자적으로
+// -> 중복 처리 원칙적으로 불가능
+// -> 성능 저하
+
+properties.put("transactional.id", "unique-id");
+producer.initTransactions();
+```
+
+### Consumer Lag 모니터링
+
+```
+Partition 0:
+  Latest Offset (카프카가 저장한 메시지): 10,000
+  Consumer Offset (컨슈머가 처리한 위치): 9,990
+  Lag: 10,000 - 9,990 = 10 메시지
+  
+  -> 컨슈머가 뒤쳐지고 있음 (처리가 느림)
+```
+
+---
+
+## 5. Rebalancing과 Sticky Assignment
+
+### Rebalancing 발생 시나리오
+
+```
+초기 상태 (3 컨슈머, 12 파티션):
+Consumer 1: [0,1,2,3]
+Consumer 2: [4,5,6,7]
+Consumer 3: [8,9,10,11]
+
+컨슈머 1 크래시 ↓ Rebalancing 시작
+
+문제: Eager Rebalancing
+Consumer 1: 죽음
+Consumer 2: [0,1,2,3,4,5,6,7,8] <- 모든 파티션 재할당
+Consumer 3: [9,10,11]
+
+문제점:
+- 모든 컨슈머의 offset 초기화
+- Stop-the-world 처리 (2-3분)
+- 그동안 메시지 처리 중단
+```
+
+### Sticky Assignment
+
+```
+개선된 Rebalancing (Sticky):
+
+초기 상태:
+Consumer 1: [0,1,2,3]
+Consumer 2: [4,5,6,7]
+Consumer 3: [8,9,10,11]
+
+컨슈머 1 크래시 ↓ Sticky Rebalancing
+
+결과:
+Consumer 1: 죽음
+Consumer 2: [4,5,6,7] + [0,1] <- 최소한의 재할당
+Consumer 3: [8,9,10,11] + [2,3]
+
+이점:
+- 기존 할당 유지 (대부분)
+- 재시작 시간 짧음 (수 초)
+- Consumer 2,3의 offset 유지
+```
+
+설정:
+
+```java
+props.put("partition.assignment.strategy", 
+    "org.apache.kafka.clients.consumer.StickyAssignor");
+
+// 또는 여러 전략 조합
+props.put("partition.assignment.strategy",
+    "org.apache.kafka.clients.consumer.StickyAssignor," +
+    "org.apache.kafka.clients.consumer.RangeAssignor");
+```
+
+---
+
+## 6. Partitioning 전략 비교
+
+### Strategy 1: Range Assignment
+
+```
+Topic: "orders" (12개 파티션)
+Consumer Group: 3개 컨슈머
+
+파티션: 0,1,2,3,4,5,6,7,8,9,10,11
+
+Range 할당:
+Consumer 1: [0,1,2,3]     (range: 0-3)
+Consumer 2: [4,5,6,7]     (range: 4-7)
+Consumer 3: [8,9,10,11]   (range: 8-11)
+
+특징:
+- 간단한 로직
+- 예측 가능
+- 문제: 토픽이 여러 개면 hotspot 발생
+```
+
+### Strategy 2: Round-Robin Assignment
+
+```
+Topic: "orders" (12개 파티션)
+Consumer Group: 3개 컨슈머
+
+Round-robin 할당:
+Consumer 1: [0,3,6,9]     (0부터 시작, 간격 3)
+Consumer 2: [1,4,7,10]
+Consumer 3: [2,5,8,11]
+
+특징:
+- 더 균등한 분산
+- 여러 토픽에도 균형
+- 재할당 시 변화 많음
+```
+
+### Strategy 3: Sticky Assignment
+
+```
+초기 range:
+Consumer 1: [0,1,2,3]
+Consumer 2: [4,5,6,7]
+Consumer 3: [8,9,10,11]
+
+컨슈머 1 추가 ↓
+
+Range (기존):
+모두 재할당됨 (불리)
+
+Sticky:
+Consumer 1: [0,1,2,3]
+Consumer 2: [4,5,6]
+Consumer 3: [7,8,9]
+Consumer 4: [10,11]
+
+특징:
+- 기존 할당 최대한 유지
+- Rebalancing 오버헤드 최소화
+- 프로덕션 권장
+```
+
+---
+
+## 7. Producer 설정과 성능 튜닝
+
+### 배치 처리 (Batching)
+
+```java
+props.put("batch.size", 16384);           // 16 KB 이상 모으면 전송
+props.put("linger.ms", 10);               // 또는 10ms마다 전송
+
+ProducerRecord<String, String> record1 = new ProducerRecord<>("topic", "key1", "val1");
+ProducerRecord<String, String> record2 = new ProducerRecord<>("topic", "key1", "val2");
+
+producer.send(record1);  // -> 배치에 추가 (아직 전송 안 함)
+producer.send(record2);  // -> 배치에 추가
+
+// 10ms 후 또는 16KB 넘으면 함께 전송
+```
+
+### Compression
+
+```java
+props.put("compression.type", "snappy");  // snappy, gzip, lz4, zstd
+
+이점:
+- 네트워크 대역폭 감소
+- 디스크 저장 공간 감소
+
+트레이드오프:
+- CPU 오버헤드 증가 (snappy: 낮음, gzip: 높음)
+```
+
+### Acks 설정 (신뢰성)
+
+```java
+// 1. Fastest (위험)
+props.put("acks", "0");
+// -> Broker 응답 기다리지 않음
+// -> 손실 가능성 높음
+// -> 처리량 최고
+
+// 2. Balanced (권장)
+props.put("acks", "1");  // 기본값
+// -> Leader broker만 확인
+// -> 빠르고 안전
+// -> Follower 복제 완료는 기다리지 않음
+
+// 3. Safest (느림)
+props.put("acks", "all");  // 또는 "acks", "-1"
+// -> 모든 in-sync replica 확인
+// -> 손실 불가능
+// -> 처리량 낮음
+```
+
+---
+
+## 8. 성능 모니터링과 튜닝
+
+### Key Metrics
+
+```
+Producer 메트릭:
+- record-send-rate: 초당 송신 레코드 수
+- record-error-rate: 초당 실패율
+- request-latency: 평균 요청 지연 시간
+
+Consumer 메트릭:
+- records-consumed-rate: 초당 소비 레코드 수
+- fetch-latency: poll() 대기 시간
+- consumer-lag: 파티션별 처리 지연
+```
+
+### 병목 지점 파악
+
+```
+문제: Consumer lag 증가 중
+
+원인 분석:
+1. records-consumed-rate 낮음?
+   -> 컨슈머 처리 느림 (application 코드)
+   
+2. fetch-latency 높음?
+   -> 네트워크 지연 또는 broker 부하
+   
+3. partition 특정 값만 높음?
+   -> Hotspot (파티션 키 설계 문제)
+   
+해결:
+- 컨슈머 수 증가 (파티션 수까지만)
+- 배치 크기 조정
+- 파티션 키 재설계
+```
+
+---
+
+## 9. Exactly-Once vs At-Least-Once
+
+### At-Least-Once (기본, 권장)
+
+```
+메시지 1: 
+  Consumer: 처리 시작
+  DB: INSERT 완료
+  Offset: 커밋 전 -> 크래시
+  
+  재시작 후:
+  Consumer: 메시지 1 다시 처리
+  DB: INSERT 시도 -> 중복 행 또는 에러
+  
+해결: Idempotent 처리
+  - PRIMARY KEY conflict -> 무시
+  - Upsert 사용
+  - Version 기반 업데이트
+```
+
+### Exactly-Once (복잡, 비용)
+
+```
+Kafka Transaction + Idempotent Producer
+
+producer.beginTransaction();
+try {
+    // 메시지 소비 + DB 저장을 원자적으로
+    ConsumerRecords<K,V> records = consumer.poll(...);
+    
+    for (ConsumerRecord<K,V> record : records) {
+        processAndStore(record);
+    }
+    
+    consumer.commitSync();  // Transaction 내부
+    producer.commitTransaction();
+} catch (Exception e) {
+    producer.abortTransaction();
+    throw e;
+}
+
+비용: 성능 30-50% 저하
+```
+
+---
+
+## 결론
+
+**Partition Key 설계가 시스템을 결정한다:**
+
+```
+좋은 설계:
+- 순서 필요성 고려 (같은 엔티티 키)
+- 부하 균등 분산 (Hotspot 피함)
+- 동시성 제어 경계 설정 (락 최소화)
+
+모니터링:
+- Consumer lag (처리 지연)
+- Partition skew (핫스팟)
+- Rebalancing 빈도
+
+튜닝:
+- 파티션 수 (처리량 × 1.5~2배)
+- Compression (snappy 추천)
+- Sticky assignment (프로덕션)
+```
+
+Kafka는 단순해 보이지만, 파티셔닝 설계 하나로 시스템의 확장성과 안정성이 결정된다.
+
+---
+
+## 출처
+
+이 글은 다음 Apache Kafka 공식 문서와 자료를 기반으로 작성되었습니다:
+
+### Apache Kafka 공식 자료
+
+| 출처 | 내용 |
+|------|------|
+| [Apache Kafka JavaDoc - KafkaConsumer](https://kafka.apache.org/31/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html) | Consumer Group 구조, Group Coordinator, Heartbeat, session.timeout.ms, max.poll.interval.ms, ConsumerRebalanceListener |
+| [Apache Kafka JavaDoc - Partitioner](https://kafka.apache.org/31/javadoc/org/apache/kafka/clients/producer/Partitioner.html) | Partitioner 인터페이스, hash 기반 할당, 부하 분산 |
+| [Apache Kafka - A Guide To The Kafka Protocol](https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol) | Producer/Consumer 프로토콜, ProduceRequest/Response, FetchRequest/Response |
+
+### Confluent 공식 문서
+
+| 출처 | 내용 |
+|------|------|
+| [Confluent - Kafka Concepts](https://docs.confluent.io/kafka-clients/java/current/overview.html) | Kafka 핵심 개념, Producer/Consumer 동작, partition.assignment.strategy, enable.auto.commit 등 |
+
+- [Confluent - Kafka Concepts](https://docs.confluent.io/kafka-clients/java/current/overview.html) - Kafka 핵심 개념, Producer/Consumer 동작
