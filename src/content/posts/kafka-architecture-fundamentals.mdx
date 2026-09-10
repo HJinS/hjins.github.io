@@ -1135,16 +1135,20 @@ props.put("max.in.flight.requests.per.connection", 5);  # 최대 5개 요청 동
 ```
 제약 1: In-Memory Cache 사용
   <- Broker가 in-memory cache에 저장 (메모리 한정)
-  <- 제한 시간(5분): log.message.timestamp.difference.max.ms
-  <- Broker 재시작 후 캐시 초기화 -> 중복 가능성
+  <- Broker의 메모리와 보존 정책에 의해 제한됨
+  <- Broker 재시작 후: 새로운 Epoch 할당, 이전 식별 정보 소실 -> 중복 가능성
+  <- 해결: acks=all 설정 필수 (복제 완료 후 ACK)
 
 제약 2: Broker 간 복제 미포함
-  Leader Broker A에 저장됨
-  <- ACK 반환
-  <- Follower Broker B로 복제 중
-  <- 만약 Leader A 실패, Follower B 선출 전에 재전송
-  <- Broker B는 모르니까 중복 가능성
-  <- 해결: acks=all 사용 (모든 ISR 복제 후 ACK)
+  acks=1 설정 시:
+  - Leader Broker A에만 저장됨
+  - ACK 반환 (Follower 복제 전)
+  - Leader A 실패 -> Follower B 선출 전에 재전송
+  - Broker B는 메시지를 모름 -> 중복 가능성
+  
+  해결: acks=all 사용
+  - 모든 ISR 복제 완료 후 ACK
+  - 리더 장애 시에도 안전
 
 제약 3: Cross-Producer 중복 방지 안 함
   Producer 1 -> 메시지 A
@@ -1183,13 +1187,13 @@ props.put("max.in.flight.requests.per.connection", 5);  # 최대 5개 요청 동
   지연시간: 2ms
   
 활성화 (Kafka 3.0+):
-  처리량: 950,000 msg/sec (~5% 감소)
+  처리량: 거의 동일 (환경에 따라 1-5% 내외 감소)
   지연시간: 2ms (변화 없음)
   
 이유: 
-  - (ProducerId, Sequence) 체크 오버헤드
-  - 메모리 캐시 관리
-  - 부작용 미미 -> 권장
+  - (ProducerId, Sequence) 체크 오버헤드 (매우 낮음)
+  - 메모리 캐시 관리 (최적화됨)
+  - 성능 영향 무시할 수 있는 수준 -> 권장
 ```
 
 **출처:** 
@@ -1200,6 +1204,9 @@ props.put("max.in.flight.requests.per.connection", 5);  # 최대 5개 요청 동
 ---
 
 ## 10. Consumer 요청 흐름 (Protocol 사양)
+
+**주의:** 본 섹션은 **Kafka 2.x ~ 3.x의 Classic Consumer Group Protocol**을 설명합니다. 
+Kafka 4.0+에서는 새로운 Consumer Protocol이 도입되어 일부 동작이 달라질 수 있습니다.
 
 ```mermaid
 graph TD
