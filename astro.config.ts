@@ -80,6 +80,15 @@ export default defineConfig({
       styles: ["normal"],
       formats: ["woff", "ttf"],
     },
+    {
+      name: "Nanum Gothic Coding",
+      cssVariable: "--font-nanum-gothic-coding",
+      provider: fontProviders.google(),
+      fallbacks: ["monospace"],
+      weights: [400, 700],
+      styles: ["normal"],
+      formats: ["woff", "ttf"],
+    },
   ],
   env: {
     schema: {
